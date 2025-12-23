@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   getDocs, 
@@ -7,7 +6,9 @@ import {
   setDoc, 
   doc, 
   getDoc,
-  deleteDoc
+  deleteDoc,
+  orderBy,
+  limit
 } from 'firebase/firestore';
 import { db, membersCollection } from './firebase';
 import { AllianceMember, Rank, AllianceStats, AllianceConfig } from './types';
@@ -32,28 +33,41 @@ import {
   ChevronDown,
   TrendingUp,
   Sun,
-  Moon
+  Moon,
+  Swords,
+  BarChart3
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
 type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk';
-type ViewMode = 'rank' | 'power_ranking';
+type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking';
+type DuelSubMode = 'daily' | 'weekly';
 type Theme = 'light' | 'dark';
+
+interface WeeklyScore {
+  name: string;
+  totalScore: number;
+  daysCount: number;
+  level: number;
+  rank: Rank;
+}
 
 const App: React.FC = () => {
   const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [members, setMembers] = useState<AllianceMember[]>([]);
   const [loading, setLoading] = useState(true);
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingMember, setEditingMember] = useState<AllianceMember | null>(null);
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
   const [viewMode, setViewMode] = useState<ViewMode>('rank');
+  const [duelSubMode, setDuelSubMode] = useState<DuelSubMode>('daily');
+  const [weeklyData, setWeeklyData] = useState<WeeklyScore[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [theme, setTheme] = useState<Theme>(() => {
     return (localStorage.getItem('theme') as Theme) || 'dark';
   });
   
-  // Rütbe gruplarının açık/kapalı durumunu tutan state
   const [expandedRanks, setExpandedRanks] = useState<Record<Rank, boolean>>({
     [Rank.R3]: true,
     [Rank.R2]: true,
@@ -72,6 +86,7 @@ const App: React.FC = () => {
   const [formLevel, setFormLevel] = useState(20);
   const [formRank, setFormRank] = useState<Rank>(Rank.R1);
   const [formTeam1Power, setFormTeam1Power] = useState('');
+  const [formDuelScore, setFormDuelScore] = useState('');
 
   useEffect(() => {
     localStorage.setItem('theme', theme);
@@ -82,10 +97,7 @@ const App: React.FC = () => {
   };
 
   const toggleRankGroup = (rank: Rank) => {
-    setExpandedRanks(prev => ({
-      ...prev,
-      [rank]: !prev[rank]
-    }));
+    setExpandedRanks(prev => ({ ...prev, [rank]: !prev[rank] }));
   };
 
   const fetchConfig = async () => {
@@ -95,9 +107,7 @@ const App: React.FC = () => {
         const data = configDoc.data() as AllianceConfig;
         if (data.logo) setConfig(prev => ({ ...prev, logo: data.logo }));
       }
-    } catch (error) {
-      console.error("Config load error:", error);
-    }
+    } catch (error) {}
   };
 
   const fetchMembers = async (date: string) => {
@@ -117,21 +127,68 @@ const App: React.FC = () => {
     }
   };
 
+  const fetchWeeklyData = async () => {
+    setWeeklyLoading(true);
+    try {
+      const dateList: string[] = [];
+      const current = new Date(selectedDate);
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(current);
+        d.setDate(d.getDate() - i);
+        dateList.push(d.toISOString().split('T')[0]);
+      }
+
+      const q = query(membersCollection, where("date", "in", dateList));
+      const querySnapshot = await getDocs(q);
+      
+      const aggregation: Record<string, WeeklyScore> = {};
+      querySnapshot.forEach(doc => {
+        const m = doc.data() as AllianceMember;
+        if (!aggregation[m.name]) {
+          aggregation[m.name] = { 
+            name: m.name, 
+            totalScore: 0, 
+            daysCount: 0, 
+            level: m.level, 
+            rank: m.rank 
+          };
+        }
+        aggregation[m.name].totalScore += m.duelScore || 0;
+        aggregation[m.name].daysCount += 1;
+        // En güncel veriyi baz al
+        if (m.date === selectedDate) {
+          aggregation[m.name].level = m.level;
+          aggregation[m.name].rank = m.rank;
+        }
+      });
+
+      const sorted = Object.values(aggregation).sort((a, b) => b.totalScore - a.totalScore);
+      setWeeklyData(sorted);
+    } catch (error) {
+      console.error("Weekly fetch error:", error);
+    } finally {
+      setWeeklyLoading(false);
+    }
+  };
+
   useEffect(() => {
     fetchConfig();
     fetchMembers(selectedDate);
     setActiveFilter('all'); 
   }, [selectedDate]);
 
+  useEffect(() => {
+    if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
+      fetchWeeklyData();
+    }
+  }, [viewMode, duelSubMode, selectedDate]);
+
   const stats = useMemo<AllianceStats>(() => {
     const lowPower = members.filter(m => m.power < 10).length;
     const lowLevel = members.filter(m => m.level < 20).length;
     const atRisk = members.filter(m => m.power < 10 || m.level < 20 || m.team1Power < 3).length;
     return {
-      totalMembers: members.length,
-      lowPowerCount: lowPower,
-      lowLevelCount: lowLevel,
-      totalAtRisk: atRisk
+      totalMembers: members.length, lowPowerCount: lowPower, lowLevelCount: lowLevel, totalAtRisk: atRisk
     };
   }, [members]);
 
@@ -141,14 +198,18 @@ const App: React.FC = () => {
       const queryStr = searchQuery.toLowerCase();
       result = result.filter(m => m.name.toLowerCase().includes(queryStr));
     }
-    switch (activeFilter) {
-      case 'lowPower': result = result.filter(m => m.power < 10); break;
-      case 'lowLevel': result = result.filter(m => m.level < 20); break;
-      case 'atRisk': result = result.filter(m => m.power < 10 || m.level < 20 || m.team1Power < 3); break;
+    if (viewMode !== 'duel_ranking') {
+      switch (activeFilter) {
+        case 'lowPower': result = result.filter(m => m.power < 10); break;
+        case 'lowLevel': result = result.filter(m => m.level < 20); break;
+        case 'atRisk': result = result.filter(m => m.power < 10 || m.level < 20 || m.team1Power < 3); break;
+      }
+      result.sort((a, b) => b.power - a.power);
+    } else {
+      result.sort((a, b) => (b.duelScore || 0) - (a.duelScore || 0));
     }
-    result.sort((a, b) => b.power - a.power);
     return result;
-  }, [members, activeFilter, searchQuery]);
+  }, [members, activeFilter, searchQuery, viewMode]);
 
   const handleCopyYesterday = async () => {
     const d = new Date(selectedDate);
@@ -162,28 +223,27 @@ const App: React.FC = () => {
         const data = d.data() as AllianceMember;
         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
         const newId = `${selectedDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
-        const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, updatedAt: Date.now() };
+        // Kopyalarken düello puanını sıfırla ki her gün yeni puan girilsin
+        const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, duelScore: 0, updatedAt: Date.now() };
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
       await Promise.all(batchPromises);
       await fetchMembers(selectedDate);
-      alert("Aktarıldı.");
-    } catch (error) {
-      alert("Hata oluştu.");
-    } finally {
-      setLoading(false);
-    }
+      alert("Üye listesi kopyalandı. Düello puanları yeni gün için sıfırlandı.");
+    } catch (error) { alert("Hata!"); } finally { setLoading(false); }
   };
 
   const handleSaveMember = async (e: React.FormEvent) => {
     e.preventDefault();
     const powerVal = parseFloat(formPower);
     const team1PowerVal = parseFloat(formTeam1Power);
+    const duelScoreVal = parseFloat(formDuelScore) || 0;
     const safeName = (formName || 'uye').replace(/\s+/g, '_');
     const memberId = editingMember ? editingMember.id : `${selectedDate}_${safeName}_${Date.now()}`;
     const newMember: AllianceMember = {
       id: memberId, date: selectedDate, name: formName, nameImage: formNameImage ?? null,
-      power: powerVal, level: formLevel, rank: formRank, team1Power: team1PowerVal, updatedAt: Date.now()
+      power: powerVal, level: formLevel, rank: formRank, team1Power: team1PowerVal, 
+      duelScore: duelScoreVal, updatedAt: Date.now()
     };
     try {
       await setDoc(doc(db, "alliance_members", memberId), newMember);
@@ -217,10 +277,10 @@ const App: React.FC = () => {
     if (member) {
       setEditingMember(member); setFormName(member.name); setFormNameImage(member.nameImage ?? null);
       setFormPower(member.power.toString()); setFormLevel(member.level); setFormRank(member.rank);
-      setFormTeam1Power(member.team1Power.toString());
+      setFormTeam1Power(member.team1Power.toString()); setFormDuelScore((member.duelScore || 0).toString());
     } else {
       setEditingMember(null); setFormName(''); setFormNameImage(null);
-      setFormPower(''); setFormLevel(20); setFormRank(Rank.R1); setFormTeam1Power('');
+      setFormPower(''); setFormLevel(20); setFormRank(Rank.R1); setFormTeam1Power(''); setFormDuelScore('');
     }
     setIsModalOpen(true);
   };
@@ -311,9 +371,19 @@ const App: React.FC = () => {
           <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Kritik" value={stats.totalAtRisk} color="rose" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
         </div>
 
-        <div className={`flex items-center gap-2 mb-6 ${theme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-200/50 border-slate-300'} p-1 rounded-lg border w-fit`}>
-          <button onClick={() => setViewMode('rank')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'rank' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}>Rütbe Görünümü</button>
-          <button onClick={() => setViewMode('power_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'power_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}>Güç Sıralaması</button>
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
+          <div className={`flex items-center gap-2 ${theme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-200/50 border-slate-300'} p-1 rounded-lg border w-fit`}>
+            <button onClick={() => setViewMode('rank')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'rank' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><LayoutGrid className="w-3 h-3 inline mr-1" /> Rütbe</button>
+            <button onClick={() => setViewMode('power_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'power_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><ListOrdered className="w-3 h-3 inline mr-1" /> Güç</button>
+            <button onClick={() => setViewMode('duel_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'duel_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><Swords className="w-3 h-3 inline mr-1" /> Düello</button>
+          </div>
+
+          {viewMode === 'duel_ranking' && (
+             <div className={`flex items-center gap-1 ${theme === 'dark' ? 'bg-slate-800/50' : 'bg-slate-100'} p-1 rounded-md border border-slate-700/30`}>
+                <button onClick={() => setDuelSubMode('daily')} className={`px-3 py-1 rounded text-[9px] font-black uppercase tracking-tighter transition-all ${duelSubMode === 'daily' ? 'bg-slate-900 text-amber-500 shadow-sm' : 'text-slate-500'}`}>Günlük</button>
+                <button onClick={() => setDuelSubMode('weekly')} className={`px-3 py-1 rounded text-[9px] font-black uppercase tracking-tighter transition-all ${duelSubMode === 'weekly' ? 'bg-slate-900 text-amber-500 shadow-sm' : 'text-slate-500'}`}>Haftalık</button>
+             </div>
+          )}
         </div>
 
         <div className={`${themeClasses.card} border rounded-xl overflow-hidden shadow-2xl transition-all`}>
@@ -323,9 +393,19 @@ const App: React.FC = () => {
                 <tr className={`${themeClasses.tableHeader} border-b border-slate-700/50 text-[10px] font-black uppercase tracking-widest`}>
                   <th className="px-4 py-3 w-16">Sıra</th>
                   <th className="px-4 py-3">Üye Bilgisi</th>
-                  <th className="px-4 py-3">Seviye</th>
-                  <th className="px-4 py-3">Toplam Güç</th>
-                  <th className="px-4 py-3">Takım 1</th>
+                  {viewMode !== 'duel_ranking' ? (
+                    <>
+                      <th className="px-4 py-3">Seviye</th>
+                      <th className="px-4 py-3">Toplam Güç</th>
+                      <th className="px-4 py-3">Takım 1</th>
+                    </>
+                  ) : (
+                    <>
+                      <th className="px-4 py-3">Günlük Puan</th>
+                      <th className="px-4 py-3">Haftalık Toplam</th>
+                      <th className="px-4 py-3">İstikrar</th>
+                    </>
+                  )}
                   <th className="px-4 py-3">Rütbe</th>
                   <th className="px-4 py-3 text-right">İşlemler</th>
                 </tr>
@@ -333,16 +413,27 @@ const App: React.FC = () => {
               <tbody>
                 {viewMode === 'power_ranking' ? (
                   filteredMembers.map((m, idx) => (
-                    <MemberRow key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} />
+                    <MemberRow key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode} />
                   ))
+                ) : viewMode === 'duel_ranking' ? (
+                   duelSubMode === 'daily' ? (
+                    filteredMembers.map((m, idx) => (
+                      <MemberRow key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode} />
+                    ))
+                   ) : (
+                    weeklyLoading ? (
+                      <tr><td colSpan={7} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Haftalık Veriler Toplanıyor...</p></td></tr>
+                    ) : (
+                      weeklyData.map((w, idx) => (
+                        <WeeklyRow key={w.name} data={w} rankIdx={idx + 1} theme={theme} />
+                      ))
+                    )
+                   )
                 ) : (
                   ([Rank.R3, Rank.R2, Rank.R1] as Rank[]).map(rank => (
                     <React.Fragment key={rank}>
                       {groupedByRank[rank].length > 0 && (
-                        <tr 
-                          onClick={() => toggleRankGroup(rank)}
-                          className={`cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-950/40 hover:bg-slate-900/60' : 'bg-slate-100/50 hover:bg-slate-200/50'}`}
-                        >
+                        <tr onClick={() => toggleRankGroup(rank)} className={`cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-950/40 hover:bg-slate-900/60' : 'bg-slate-100/50 hover:bg-slate-200/50'}`}>
                           <td colSpan={7} className="px-4 py-3 border-y border-slate-700/30">
                             <div className="flex items-center gap-2">
                               {expandedRanks[rank] ? <ChevronDown className="w-3 h-3 text-amber-500" /> : <ChevronRight className="w-3 h-3 text-amber-500" />}
@@ -352,12 +443,12 @@ const App: React.FC = () => {
                         </tr>
                       )}
                       {expandedRanks[rank] && groupedByRank[rank].map((m, idx) => (
-                        <MemberRow key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} />
+                        <MemberRow key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode} />
                       ))}
                     </React.Fragment>
                   ))
                 )}
-                {!loading && filteredMembers.length === 0 && (
+                {!loading && filteredMembers.length === 0 && !weeklyLoading && (
                   <tr><td colSpan={7} className="p-12 text-center text-slate-500 font-bold italic">Kayıt bulunamadı.</td></tr>
                 )}
               </tbody>
@@ -368,7 +459,7 @@ const App: React.FC = () => {
 
       {isModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-          <div className={`${themeClasses.modal} border rounded-2xl w-full max-sm shadow-2xl animate-in zoom-in duration-200`}>
+          <div className={`${themeClasses.modal} border rounded-2xl w-full max-w-sm shadow-2xl animate-in zoom-in duration-200`}>
             <div className={`p-4 border-b ${theme === 'dark' ? 'border-slate-800' : 'border-slate-200'} flex justify-between items-center`}>
               <h3 className={`text-sm font-black uppercase tracking-wider ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{editingMember ? 'Düzenle' : 'Yeni Üye'}</h3>
               <button onClick={closeModal} className="text-slate-500 hover:text-white">✕</button>
@@ -378,27 +469,24 @@ const App: React.FC = () => {
                 <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">İsim</label>
                 <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none focus:border-amber-500`} />
               </div>
-              <div>
-                <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">İsim Görseli (Opsiyonel)</label>
-                <input type="file" accept="image/*" onChange={handleImageUpload} className="text-[10px] text-slate-400" />
+              <div className="grid grid-cols-2 gap-3">
+                <MiniInput label="Toplam Güç (M)" value={formPower} onChange={setFormPower} theme={theme} />
+                <MiniInput label="Düello Puanı (M)" value={formDuelScore} onChange={setFormDuelScore} theme={theme} />
               </div>
               <div className="grid grid-cols-2 gap-3">
-                <MiniInput label="Toplam (M)" value={formPower} onChange={setFormPower} theme={theme} />
                 <MiniInput label="Takım 1 (M)" value={formTeam1Power} onChange={setFormTeam1Power} theme={theme} />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Sv.</label>
+                  <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Seviye</label>
                   <select value={formLevel} onChange={(e) => setFormLevel(parseInt(e.target.value))} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none`}>
                     {Array.from({length: 17}, (_, i) => i + 14).map(l => <option key={l} value={l}>Sv.{l}</option>)}
                   </select>
                 </div>
-                <div>
-                  <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Rütbe</label>
-                  <select value={formRank} onChange={(e) => setFormRank(e.target.value as Rank)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none`}>
-                    <option value={Rank.R3}>R3</option><option value={Rank.R2}>R2</option><option value={Rank.R1}>R1</option>
-                  </select>
-                </div>
+              </div>
+              <div>
+                <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Rütbe</label>
+                <select value={formRank} onChange={(e) => setFormRank(e.target.value as Rank)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none`}>
+                  <option value={Rank.R3}>R3</option><option value={Rank.R2}>R2</option><option value={Rank.R1}>R1</option>
+                </select>
               </div>
               <button type="submit" className="w-full bg-amber-500 text-slate-900 font-black py-3 rounded-lg text-xs uppercase tracking-widest shadow-lg active:scale-95 transition-all">Kaydet</button>
             </form>
@@ -424,40 +512,39 @@ const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) =>
   );
 };
 
-const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete }: any) => {
+const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode }: any) => {
   const isAtRisk = member.power < 10 || member.level < 20 || member.team1Power < 3;
+  const isDuelMode = viewMode === 'duel_ranking';
+  
   return (
-    <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'} ${isAtRisk ? (theme === 'dark' ? 'bg-rose-500/[0.02]' : 'bg-rose-500/[0.05]') : ''}`}>
+    <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'} ${isAtRisk && !isDuelMode ? (theme === 'dark' ? 'bg-rose-500/[0.02]' : 'bg-rose-500/[0.05]') : ''}`}>
       <td className="px-4 py-2 text-xs font-black font-mono">
-        {rankIdx ? (
-          <div className="flex items-center gap-1">
-            <span className={`inline-flex items-center justify-center w-7 h-7 rounded-md text-[11px] font-black shadow-sm ${rankIdx === 1 ? 'bg-amber-500 text-slate-900 shadow-amber-500/30' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800/80 text-white' : (theme === 'dark' ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600')}`}>
-              {rankIdx}
-            </span>
-          </div>
-        ) : <ChevronRight className="w-3 h-3 opacity-20" />}
+        <div className="flex items-center gap-1">
+          <span className={`inline-flex items-center justify-center w-7 h-7 rounded-md text-[11px] font-black shadow-sm ${rankIdx === 1 ? 'bg-amber-500 text-slate-900 shadow-amber-500/30 animate-pulse' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800/80 text-white' : (theme === 'dark' ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600')}`}>
+            {rankIdx || <ChevronRight className="w-3 h-3 opacity-20" />}
+          </span>
+        </div>
       </td>
       <td className="px-4 py-2">
         <div className="flex items-center gap-2">
           {member.nameImage ? <img src={member.nameImage} className="h-6 w-16 object-contain rounded bg-slate-950 p-0.5" /> : <span className={`text-xs font-bold transition-colors ${theme === 'dark' ? 'text-white group-hover:text-amber-400' : 'text-slate-900 group-hover:text-amber-600'}`}>{member.name}</span>}
-          {isAtRisk && <AlertTriangle className="w-3 h-3 text-rose-500" />}
+          {isAtRisk && !isDuelMode && <AlertTriangle className="w-3 h-3 text-rose-500" />}
         </div>
       </td>
-      <td className="px-4 py-2">
-        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded border ${member.level < 20 ? 'text-rose-500 border-rose-500/20' : 'text-green-500 border-green-500/20'}`}>Sv.{member.level}</span>
-      </td>
-      <td className="px-4 py-2">
-        <div className="flex items-center gap-1.5">
-          <span className={`text-xs font-black ${member.power < 10 ? 'text-rose-400' : 'text-amber-400'}`}>{member.power.toFixed(1)}M</span>
-          {member.power >= 20 && <TrendingUp className="w-3 h-3 text-emerald-500" />}
-        </div>
-      </td>
-      <td className="px-4 py-2">
-        <span className={`text-xs font-black ${member.team1Power < 3 ? 'text-rose-400' : 'text-blue-400'}`}>{member.team1Power.toFixed(1)}M</span>
-      </td>
-      <td className="px-4 py-2">
-        <span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${member.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : member.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{member.rank}</span>
-      </td>
+      {!isDuelMode ? (
+        <>
+          <td className="px-4 py-2"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded border ${member.level < 20 ? 'text-rose-500 border-rose-500/20' : 'text-green-500 border-green-500/20'}`}>Sv.{member.level}</span></td>
+          <td className="px-4 py-2"><div className="flex items-center gap-1.5"><span className={`text-xs font-black ${member.power < 10 ? 'text-rose-400' : 'text-amber-400'}`}>{member.power.toFixed(1)}M</span></div></td>
+          <td className="px-4 py-2"><span className={`text-xs font-black ${member.team1Power < 3 ? 'text-rose-400' : 'text-blue-400'}`}>{member.team1Power.toFixed(1)}M</span></td>
+        </>
+      ) : (
+        <>
+          <td className="px-4 py-2"><span className="text-sm font-black text-amber-500">{(member.duelScore || 0).toFixed(1)}M</span></td>
+          <td className="px-4 py-2"><span className="text-[10px] font-bold text-slate-500 italic">Puan Girişi Gerekli</span></td>
+          <td className="px-4 py-2"><div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden"><div className="h-full bg-amber-500" style={{width: `${Math.min(100, (member.duelScore / 10) * 100)}%`}}></div></div></td>
+        </>
+      )}
+      <td className="px-4 py-2"><span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${member.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : member.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{member.rank}</span></td>
       <td className="px-4 py-2 text-right">
         <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button onClick={onEdit} className="p-1.5 hover:bg-amber-500/10 rounded text-slate-400 hover:text-amber-500 transition-colors"><Edit2 className="w-3.5 h-3.5" /></button>
@@ -468,8 +555,38 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete }: any) => {
   );
 };
 
+// Fix: Use 'any' for WeeklyRow props to allow 'key' prop and maintain consistency with other row components
+const WeeklyRow = ({ data, rankIdx, theme }: any) => (
+  <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
+    <td className="px-4 py-3">
+      <div className={`inline-flex items-center justify-center w-8 h-8 rounded-lg text-xs font-black shadow-lg ${rankIdx === 1 ? 'bg-gradient-to-br from-amber-300 to-amber-600 text-slate-900 rotate-12' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800 text-white' : 'bg-slate-800 text-slate-500'}`}>
+        {rankIdx}
+      </div>
+    </td>
+    <td className="px-4 py-3">
+      <div className="flex flex-col">
+        <span className={`text-xs font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{data.name}</span>
+        <span className="text-[9px] text-slate-500 font-bold uppercase tracking-widest">{data.daysCount} Günlük Veri</span>
+      </div>
+    </td>
+    <td className="px-4 py-3"><span className="text-[10px] font-black text-slate-400">Sv.{data.level}</span></td>
+    <td className="px-4 py-3"><span className="text-sm font-black text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded">{data.totalScore.toFixed(1)}M</span></td>
+    <td className="px-4 py-3">
+       <div className="flex items-center gap-1">
+          {Array.from({length: 7}).map((_, i) => (
+            <div key={i} className={`w-2 h-2 rounded-full ${i < data.daysCount ? 'bg-emerald-500' : 'bg-slate-700'}`}></div>
+          ))}
+       </div>
+    </td>
+    <td className="px-4 py-3"><span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${data.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : data.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{data.rank}</span></td>
+    <td className="px-4 py-3 text-right">
+       {rankIdx === 1 && <Trophy className="w-4 h-4 text-amber-500 inline" />}
+    </td>
+  </tr>
+);
+
 const MiniInput = ({ label, value, onChange, theme }: any) => (
-  <div>
+  <div className="flex-1">
     <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">{label}</label>
     <input 
       type="number" step="0.1" value={value} onChange={(e) => onChange(e.target.value)} 

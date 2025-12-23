@@ -14,6 +14,7 @@ export interface AllianceMember {
   level: number;
   rank: Rank;
   team1Power: number; // in Millions
+  duelScore: number; // Daily duel points in Millions
   updatedAt: number;
 }
 
