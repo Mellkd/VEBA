@@ -1,0 +1,7 @@
+{
+  "name": "Last War Alliance Commander",
+  "description": "A professional management dashboard for Last War alliance leaders to track member power, levels, and ranks over time with visual highlights for low-performing members.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
