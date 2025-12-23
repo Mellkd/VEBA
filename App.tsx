@@ -1,6 +1,5 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-// Fix: Use standard firestore modular SDK to resolve "no exported member" errors.
 import { 
   getDocs, 
   query, 
@@ -26,11 +25,20 @@ import {
   FilterX,
   Edit2,
   Settings,
-  Image as ImageIcon
+  Image as ImageIcon,
+  LayoutGrid,
+  ListOrdered,
+  ChevronRight,
+  ChevronDown,
+  TrendingUp,
+  Sun,
+  Moon
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
 type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk';
+type ViewMode = 'rank' | 'power_ranking';
+type Theme = 'light' | 'dark';
 
 const App: React.FC = () => {
   const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
@@ -39,15 +47,25 @@ const App: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingMember, setEditingMember] = useState<AllianceMember | null>(null);
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
+  const [viewMode, setViewMode] = useState<ViewMode>('rank');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [theme, setTheme] = useState<Theme>(() => {
+    return (localStorage.getItem('theme') as Theme) || 'dark';
+  });
   
-  // Alliance Config (Logo vb.)
+  // Rütbe gruplarının açık/kapalı durumunu tutan state
+  const [expandedRanks, setExpandedRanks] = useState<Record<Rank, boolean>>({
+    [Rank.R3]: true,
+    [Rank.R2]: true,
+    [Rank.R1]: true
+  });
+
   const [config, setConfig] = useState<AllianceConfig>({
     logo: "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/ultra-ball.png",
     allianceName: "[VEBA] ATAMBİR"
   });
   const logoInputRef = useRef<HTMLInputElement>(null);
 
-  // Form states
   const [formName, setFormName] = useState('');
   const [formNameImage, setFormNameImage] = useState<string | null>(null);
   const [formPower, setFormPower] = useState('');
@@ -55,7 +73,21 @@ const App: React.FC = () => {
   const [formRank, setFormRank] = useState<Rank>(Rank.R1);
   const [formTeam1Power, setFormTeam1Power] = useState('');
 
-  // Fetch Alliance Config (Global Logo)
+  useEffect(() => {
+    localStorage.setItem('theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme(prev => prev === 'light' ? 'dark' : 'light');
+  };
+
+  const toggleRankGroup = (rank: Rank) => {
+    setExpandedRanks(prev => ({
+      ...prev,
+      [rank]: !prev[rank]
+    }));
+  };
+
   const fetchConfig = async () => {
     try {
       const configDoc = await getDoc(doc(db, "alliance_settings", "global_config"));
@@ -104,47 +136,40 @@ const App: React.FC = () => {
   }, [members]);
 
   const filteredMembers = useMemo(() => {
-    switch (activeFilter) {
-      case 'lowPower':
-        return members.filter(m => m.power < 10);
-      case 'lowLevel':
-        return members.filter(m => m.level < 20);
-      case 'atRisk':
-        return members.filter(m => m.power < 10 || m.level < 20 || m.team1Power < 3);
-      default:
-        return members;
+    let result = [...members];
+    if (searchQuery.trim()) {
+      const queryStr = searchQuery.toLowerCase();
+      result = result.filter(m => m.name.toLowerCase().includes(queryStr));
     }
-  }, [members, activeFilter]);
+    switch (activeFilter) {
+      case 'lowPower': result = result.filter(m => m.power < 10); break;
+      case 'lowLevel': result = result.filter(m => m.level < 20); break;
+      case 'atRisk': result = result.filter(m => m.power < 10 || m.level < 20 || m.team1Power < 3); break;
+    }
+    result.sort((a, b) => b.power - a.power);
+    return result;
+  }, [members, activeFilter, searchQuery]);
 
   const handleCopyYesterday = async () => {
     const d = new Date(selectedDate);
     d.setDate(d.getDate() - 1);
     const yesterday = d.toISOString().split('T')[0];
-
     setLoading(true);
     try {
       const q = query(membersCollection, where("date", "==", yesterday));
       const querySnapshot = await getDocs(q);
-      
       const batchPromises = querySnapshot.docs.map(async (d) => {
         const data = d.data() as AllianceMember;
         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
         const newId = `${selectedDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
-        const newMember: AllianceMember = {
-          ...data,
-          id: newId,
-          date: selectedDate,
-          updatedAt: Date.now()
-        };
+        const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, updatedAt: Date.now() };
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
-
       await Promise.all(batchPromises);
       await fetchMembers(selectedDate);
-      alert("Dünkü veriler başarıyla bugüne aktarıldı.");
+      alert("Aktarıldı.");
     } catch (error) {
-      console.error("Error copying data:", error);
-      alert("Veriler kopyalanamadı.");
+      alert("Hata oluştu.");
     } finally {
       setLoading(false);
     }
@@ -152,70 +177,37 @@ const App: React.FC = () => {
 
   const handleSaveMember = async (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!formName && !formNameImage) || !formPower || !formTeam1Power) {
-      alert("Lütfen zorunlu alanları doldurun.");
-      return;
-    }
-
     const powerVal = parseFloat(formPower);
     const team1PowerVal = parseFloat(formTeam1Power);
-
-    if (isNaN(powerVal) || isNaN(team1PowerVal)) {
-      alert("Lütfen geçerli sayısal değerler girin.");
-      return;
-    }
-
     const safeName = (formName || 'uye').replace(/\s+/g, '_');
     const memberId = editingMember ? editingMember.id : `${selectedDate}_${safeName}_${Date.now()}`;
     const newMember: AllianceMember = {
-      id: memberId,
-      date: selectedDate,
-      name: formName,
-      nameImage: formNameImage ?? null,
-      power: powerVal,
-      level: formLevel,
-      rank: formRank,
-      team1Power: team1PowerVal,
-      updatedAt: Date.now()
+      id: memberId, date: selectedDate, name: formName, nameImage: formNameImage ?? null,
+      power: powerVal, level: formLevel, rank: formRank, team1Power: team1PowerVal, updatedAt: Date.now()
     };
-
     try {
       await setDoc(doc(db, "alliance_members", memberId), newMember);
       await fetchMembers(selectedDate);
       closeModal();
-    } catch (error) {
-      console.error("Error saving:", error);
-      alert("Kaydedilemedi.");
-    }
+    } catch (error) { alert("Kaydedilemedi."); }
   };
 
   const handleDeleteMember = async (id: string) => {
-    if (!confirm("Bu üyeyi silmek istediğinize emin misiniz?")) return;
+    if (!confirm("Emin misiniz?")) return;
     try {
       await deleteDoc(doc(db, "alliance_members", id));
       setMembers(prev => prev.filter(m => m.id !== id));
-    } catch (error) {
-      console.error("Delete error:", error);
-      alert("Silme işlemi başarısız oldu.");
-    }
+    } catch (error) { alert("Hata!"); }
   };
 
-  // Logo Change Logic
   const handleLogoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
       reader.onloadend = async () => {
         const base64 = reader.result as string;
-        try {
-          await setDoc(doc(db, "alliance_settings", "global_config"), {
-            logo: base64
-          }, { merge: true });
-          setConfig(prev => ({ ...prev, logo: base64 }));
-          alert("Logo başarıyla güncellendi.");
-        } catch (error) {
-          alert("Logo kaydedilemedi.");
-        }
+        await setDoc(doc(db, "alliance_settings", "global_config"), { logo: base64 }, { merge: true });
+        setConfig(prev => ({ ...prev, logo: base64 }));
       };
       reader.readAsDataURL(file);
     }
@@ -223,29 +215,17 @@ const App: React.FC = () => {
 
   const openModal = (member?: AllianceMember) => {
     if (member) {
-      setEditingMember(member);
-      setFormName(member.name);
-      setFormNameImage(member.nameImage ?? null);
-      setFormPower(member.power.toString());
-      setFormLevel(member.level);
-      setFormRank(member.rank);
+      setEditingMember(member); setFormName(member.name); setFormNameImage(member.nameImage ?? null);
+      setFormPower(member.power.toString()); setFormLevel(member.level); setFormRank(member.rank);
       setFormTeam1Power(member.team1Power.toString());
     } else {
-      setEditingMember(null);
-      setFormName('');
-      setFormNameImage(null);
-      setFormPower('');
-      setFormLevel(20);
-      setFormRank(Rank.R1);
-      setFormTeam1Power('');
+      setEditingMember(null); setFormName(''); setFormNameImage(null);
+      setFormPower(''); setFormLevel(20); setFormRank(Rank.R1); setFormTeam1Power('');
     }
     setIsModalOpen(true);
   };
 
-  const closeModal = () => {
-    setIsModalOpen(false);
-    setEditingMember(null);
-  };
+  const closeModal = () => { setIsModalOpen(false); setEditingMember(null); };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -257,18 +237,11 @@ const App: React.FC = () => {
         const base64Data = base64.split(',')[1];
         if (base64Data) {
           try {
-            // Fix: Initialize GoogleGenAI right before use to ensure correct API key access.
             const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
             const response = await ai.models.generateContent({
               model: 'gemini-3-flash-preview',
-              contents: {
-                parts: [
-                  { inlineData: { mimeType: file.type, data: base64Data } },
-                  { text: "Extract ONLY the player name from this game screenshot. Return just the name string." }
-                ]
-              }
+              contents: { parts: [{ inlineData: { mimeType: file.type, data: base64Data } }, { text: "Extract name from game screenshot." }] }
             });
-            // Fix: Access .text property directly, it is not a method.
             const detectedName = response.text?.trim();
             if (detectedName) setFormName(detectedName);
           } catch (e) {}
@@ -278,151 +251,156 @@ const App: React.FC = () => {
     }
   };
 
-  const groupedMembers = {
+  const groupedByRank = {
     [Rank.R3]: filteredMembers.filter(m => m.rank === Rank.R3),
     [Rank.R2]: filteredMembers.filter(m => m.rank === Rank.R2),
     [Rank.R1]: filteredMembers.filter(m => m.rank === Rank.R1),
   };
 
-  const isHighlighted = (member: AllianceMember) => {
-    return member.power < 10 || member.level < 20 || member.team1Power < 3;
+  const themeClasses = {
+    bg: theme === 'dark' ? 'bg-[#0a0f1d] text-slate-100' : 'bg-slate-50 text-slate-900',
+    header: theme === 'dark' ? 'bg-slate-900/80 border-slate-800' : 'bg-white/80 border-slate-200',
+    card: theme === 'dark' ? 'bg-slate-900/50 border-slate-800' : 'bg-white border-slate-200 shadow-sm',
+    input: theme === 'dark' ? 'bg-slate-800/40 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900',
+    tableHeader: theme === 'dark' ? 'bg-slate-800/50 text-slate-400' : 'bg-slate-100 text-slate-500',
+    tableRow: theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50',
+    modal: theme === 'dark' ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200',
   };
 
   return (
-    <div className="min-h-screen pb-20 bg-slate-950 text-slate-100">
-      <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40 shadow-xl">
-        <div className="max-w-7xl mx-auto px-4 py-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            {/* Logo Container - Click to Change */}
-            <div 
-              onClick={() => logoInputRef.current?.click()}
-              className="group relative cursor-pointer bg-slate-800 p-0.5 rounded-full shadow-lg border-2 border-amber-500/50 overflow-hidden w-16 h-16 flex items-center justify-center transition-all hover:border-amber-400"
-              title="Logoyu Değiştirmek İçin Tıkla"
-            >
-              <img 
-                src={config.logo || "https://cdn-icons-png.flaticon.com/512/864/864685.png"} 
-                className="w-12 h-12 object-contain transition-transform group-hover:scale-110" 
-                alt="Alliance Logo" 
-              />
-              <div className="absolute inset-0 bg-amber-500/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
-                <ImageIcon className="w-6 h-6 text-white" />
-              </div>
-              <input 
-                type="file" 
-                ref={logoInputRef} 
-                className="hidden" 
-                accept="image/*" 
-                onChange={handleLogoChange} 
-              />
+    <div className={`min-h-screen pb-20 transition-colors duration-300 ${themeClasses.bg} selection:bg-amber-500/30`}>
+      <header className={`${themeClasses.header} backdrop-blur-md border-b sticky top-0 z-40 shadow-xl`}>
+        <div className="max-w-7xl mx-auto px-4 py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div onClick={() => logoInputRef.current?.click()} className="group relative cursor-pointer bg-slate-800 p-0.5 rounded-full border border-amber-500/30 w-12 h-12 flex items-center justify-center transition-all hover:border-amber-400">
+              <img src={config.logo || "https://cdn-icons-png.flaticon.com/512/864/864685.png"} className="w-9 h-9 object-contain" alt="Logo" />
+              <input type="file" ref={logoInputRef} className="hidden" accept="image/*" onChange={handleLogoChange} />
             </div>
             <div>
-              <h1 className="text-2xl font-black text-white title-font">{config.allianceName}</h1>
-              <p className="text-xs font-bold text-amber-500 tracking-widest uppercase">Üye Yönetim Paneli</p>
+              <h1 className={`text-lg font-black title-font leading-none ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{config.allianceName}</h1>
+              <p className="text-[10px] font-bold text-amber-500 tracking-widest uppercase mt-1">Strateji Masası</p>
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="relative">
-              <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className="bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 pl-10 outline-none" />
-              <Calendar className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            </div>
-            <button onClick={handleCopyYesterday} className="bg-slate-800 hover:bg-slate-700 text-white p-2.5 rounded-lg border border-slate-700 flex items-center gap-2 transition-colors">
-              <Copy className="w-4 h-4" /><span className="hidden sm:inline text-sm font-semibold">Dünkü Veriler</span>
+
+          <div className="flex-1 max-w-sm relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
+            <input 
+              type="text" placeholder="Oyuncu ara..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+              className={`w-full ${themeClasses.input} border rounded-lg py-2 pl-9 pr-4 outline-none focus:border-amber-500/50 transition-all text-xs`}
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button onClick={toggleTheme} className={`p-2 rounded border ${theme === 'dark' ? 'border-slate-700 text-slate-300 hover:bg-slate-800' : 'border-slate-200 text-slate-600 hover:bg-slate-100'} transition-all`}>
+              {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
             </button>
-            <button onClick={() => openModal()} className="bg-amber-500 hover:bg-amber-400 text-slate-900 px-4 py-2.5 rounded-lg font-bold flex items-center gap-2 shadow-lg transition-all active:scale-95">
-              <Plus className="w-5 h-5" /><span className="hidden sm:inline">Üye Ekle</span>
+            <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className={`${themeClasses.input} border rounded px-3 py-1.5 text-xs outline-none`} />
+            <button onClick={handleCopyYesterday} className={`${themeClasses.input} hover:bg-slate-200 p-2 rounded border text-slate-500`} title="Dünden kopyala"><Copy className="w-3.5 h-3.5" /></button>
+            <button onClick={() => openModal()} className="bg-amber-500 hover:bg-amber-400 text-slate-900 px-4 py-2 rounded font-black flex items-center gap-2 shadow-lg text-xs transition-transform active:scale-95">
+              <Plus className="w-4 h-4" /><span>Üye Ekle</span>
             </button>
           </div>
         </div>
       </header>
 
-      <section className="max-w-7xl mx-auto px-4 py-8">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-          <StatCard icon={<Users className="w-6 h-6" />} label="Toplam Üye" value={stats.totalMembers} color="blue" onClick={() => setActiveFilter('all')} active={activeFilter === 'all'} />
-          <StatCard icon={<Zap className="w-6 h-6" />} label="Düşük Güç (< 10M)" value={stats.lowPowerCount} color="amber" onClick={() => setActiveFilter('lowPower')} active={activeFilter === 'lowPower'} />
-          <StatCard icon={<Trophy className="w-6 h-6" />} label="Düşük Sv. (< Sv.20)" value={stats.lowLevelCount} color="purple" onClick={() => setActiveFilter('lowLevel')} active={activeFilter === 'lowLevel'} />
-          <StatCard icon={<AlertTriangle className="w-6 h-6" />} label="Kritik Durum" value={stats.totalAtRisk} color="rose" onClick={() => setActiveFilter('atRisk')} active={activeFilter === 'atRisk'} />
+      <section className="max-w-7xl mx-auto px-4 py-6">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+          <StatMini icon={<Users className="w-4 h-4" />} label="Toplam" value={stats.totalMembers} color="blue" active={activeFilter === 'all'} onClick={() => setActiveFilter('all')} theme={theme} />
+          <StatMini icon={<Zap className="w-4 h-4" />} label="Düşük Güç" value={stats.lowPowerCount} color="amber" active={activeFilter === 'lowPower'} onClick={() => setActiveFilter('lowPower')} theme={theme} />
+          <StatMini icon={<Trophy className="w-4 h-4" />} label="Düşük Sv." value={stats.lowLevelCount} color="purple" active={activeFilter === 'lowLevel'} onClick={() => setActiveFilter('lowLevel')} theme={theme} />
+          <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Kritik" value={stats.totalAtRisk} color="rose" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
         </div>
 
-        {activeFilter !== 'all' && (
-          <div className="mb-6 flex items-center justify-between bg-slate-900/50 border border-slate-800 px-4 py-2 rounded-lg">
-            <span className="text-sm text-slate-400">Filtre: <span className="text-white ml-1 font-bold">{activeFilter}</span> ({filteredMembers.length} sonuç)</span>
-            <button onClick={() => setActiveFilter('all')} className="text-xs text-rose-400 hover:text-rose-300 font-bold flex items-center gap-1"><FilterX className="w-3.5 h-3.5" />Filtreyi Temizle</button>
-          </div>
-        )}
+        <div className={`flex items-center gap-2 mb-6 ${theme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-200/50 border-slate-300'} p-1 rounded-lg border w-fit`}>
+          <button onClick={() => setViewMode('rank')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'rank' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}>Rütbe Görünümü</button>
+          <button onClick={() => setViewMode('power_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'power_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}>Güç Sıralaması</button>
+        </div>
 
-        <div className="space-y-12">
-          {([Rank.R3, Rank.R2, Rank.R1] as Rank[]).map(rank => (
-            <div key={rank} className="space-y-4">
-              <div className="flex items-center gap-3 border-b border-slate-800 pb-2">
-                <span className={`px-3 py-1 rounded text-xs font-black uppercase tracking-widest ${rank === Rank.R3 ? 'bg-rose-500/20 text-rose-500' : rank === Rank.R2 ? 'bg-amber-500/20 text-amber-500' : 'bg-blue-500/20 text-blue-500'}`}>RÜTBE {rank}</span>
-                <span className="text-slate-500 text-sm font-medium">{groupedMembers[rank].length} Üye</span>
-              </div>
-              {loading ? (
-                <div className="flex justify-center p-8"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-amber-500"></div></div>
-              ) : groupedMembers[rank].length === 0 ? (
-                <p className="text-slate-600 italic py-4">Üye bulunmuyor.</p>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {groupedMembers[rank].map(member => (
-                    <MemberCard 
-                      key={member.id} 
-                      member={member} 
-                      onEdit={() => openModal(member)} 
-                      onDelete={() => handleDeleteMember(member.id)}
-                      highlight={isHighlighted(member)}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
+        <div className={`${themeClasses.card} border rounded-xl overflow-hidden shadow-2xl transition-all`}>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[700px]">
+              <thead>
+                <tr className={`${themeClasses.tableHeader} border-b border-slate-700/50 text-[10px] font-black uppercase tracking-widest`}>
+                  <th className="px-4 py-3 w-16">Sıra</th>
+                  <th className="px-4 py-3">Üye Bilgisi</th>
+                  <th className="px-4 py-3">Seviye</th>
+                  <th className="px-4 py-3">Toplam Güç</th>
+                  <th className="px-4 py-3">Takım 1</th>
+                  <th className="px-4 py-3">Rütbe</th>
+                  <th className="px-4 py-3 text-right">İşlemler</th>
+                </tr>
+              </thead>
+              <tbody>
+                {viewMode === 'power_ranking' ? (
+                  filteredMembers.map((m, idx) => (
+                    <MemberRow key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} />
+                  ))
+                ) : (
+                  ([Rank.R3, Rank.R2, Rank.R1] as Rank[]).map(rank => (
+                    <React.Fragment key={rank}>
+                      {groupedByRank[rank].length > 0 && (
+                        <tr 
+                          onClick={() => toggleRankGroup(rank)}
+                          className={`cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-950/40 hover:bg-slate-900/60' : 'bg-slate-100/50 hover:bg-slate-200/50'}`}
+                        >
+                          <td colSpan={7} className="px-4 py-3 border-y border-slate-700/30">
+                            <div className="flex items-center gap-2">
+                              {expandedRanks[rank] ? <ChevronDown className="w-3 h-3 text-amber-500" /> : <ChevronRight className="w-3 h-3 text-amber-500" />}
+                              <span className="text-[9px] font-black text-amber-500/80 uppercase tracking-[0.2em]">Rütbe {rank} Grubu ({groupedByRank[rank].length})</span>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {expandedRanks[rank] && groupedByRank[rank].map((m, idx) => (
+                        <MemberRow key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} />
+                      ))}
+                    </React.Fragment>
+                  ))
+                )}
+                {!loading && filteredMembers.length === 0 && (
+                  <tr><td colSpan={7} className="p-12 text-center text-slate-500 font-bold italic">Kayıt bulunamadı.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 
-      {/* Modal is unchanged except for styling consistency */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md shadow-2xl animate-in fade-in zoom-in duration-200">
-            <div className="p-6 border-b border-slate-800 flex justify-between items-center">
-              <h3 className="text-xl font-bold text-white flex items-center gap-2">{editingMember ? <Edit2 className="w-5 h-5 text-amber-500" /> : <Plus className="w-5 h-5 text-amber-500" />}{editingMember ? 'Üyeyi Düzenle' : 'Yeni Üye Ekle'}</h3>
-              <button onClick={closeModal} className="text-slate-400 hover:text-white">✕</button>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className={`${themeClasses.modal} border rounded-2xl w-full max-sm shadow-2xl animate-in zoom-in duration-200`}>
+            <div className={`p-4 border-b ${theme === 'dark' ? 'border-slate-800' : 'border-slate-200'} flex justify-between items-center`}>
+              <h3 className={`text-sm font-black uppercase tracking-wider ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{editingMember ? 'Düzenle' : 'Yeni Üye'}</h3>
+              <button onClick={closeModal} className="text-slate-500 hover:text-white">✕</button>
             </div>
-            <form onSubmit={handleSaveMember} className="p-6 space-y-4">
+            <form onSubmit={handleSaveMember} className="p-5 space-y-4">
               <div>
-                <label className="block text-sm font-semibold text-slate-400 mb-1">Üye Adı</label>
-                <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 focus:ring-2 focus:ring-amber-500 outline-none" placeholder="İsim veya Arapça isim için resim yükleyin" />
+                <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">İsim</label>
+                <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none focus:border-amber-500`} />
               </div>
               <div>
-                <label className="block text-sm font-semibold text-slate-400 mb-1">İsim Görseli (Arapça İsimler İçin)</label>
-                <div className="flex items-center gap-3">
-                  <div className="h-12 w-12 rounded border-2 border-dashed flex items-center justify-center bg-slate-800 overflow-hidden">
-                    {formNameImage ? <img src={formNameImage} className="w-full h-full object-cover" /> : <Camera className="w-5 h-5 text-slate-600" />}
-                  </div>
-                  <input type="file" accept="image/*" onChange={handleImageUpload} className="text-xs text-slate-400" />
-                </div>
+                <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">İsim Görseli (Opsiyonel)</label>
+                <input type="file" accept="image/*" onChange={handleImageUpload} className="text-[10px] text-slate-400" />
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <InputGroup label="Toplam Güç (M)" value={formPower} onChange={setFormPower} />
-                <InputGroup label="Takım 1 Gücü (M)" value={formTeam1Power} onChange={setFormTeam1Power} />
+              <div className="grid grid-cols-2 gap-3">
+                <MiniInput label="Toplam (M)" value={formPower} onChange={setFormPower} theme={theme} />
+                <MiniInput label="Takım 1 (M)" value={formTeam1Power} onChange={setFormTeam1Power} theme={theme} />
               </div>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-sm font-semibold text-slate-400 mb-1">Seviye</label>
-                  <select value={formLevel} onChange={(e) => setFormLevel(parseInt(e.target.value))} className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 outline-none">
-                    {Array.from({length: 17}, (_, i) => i + 14).map(lv => <option key={lv} value={lv}>Sv.{lv}</option>)}
+                  <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Sv.</label>
+                  <select value={formLevel} onChange={(e) => setFormLevel(parseInt(e.target.value))} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none`}>
+                    {Array.from({length: 17}, (_, i) => i + 14).map(l => <option key={l} value={l}>Sv.{l}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-sm font-semibold text-slate-400 mb-1">Rütbe</label>
-                  <select value={formRank} onChange={(e) => setFormRank(e.target.value as Rank)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 outline-none">
+                  <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Rütbe</label>
+                  <select value={formRank} onChange={(e) => setFormRank(e.target.value as Rank)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none`}>
                     <option value={Rank.R3}>R3</option><option value={Rank.R2}>R2</option><option value={Rank.R1}>R1</option>
                   </select>
                 </div>
               </div>
-              <div className="pt-4 flex gap-3">
-                <button type="button" onClick={closeModal} className="flex-1 bg-slate-800 text-slate-300 font-bold py-3 rounded-lg hover:bg-slate-700 transition-colors">Vazgeç</button>
-                <button type="submit" className="flex-1 bg-amber-500 text-slate-900 font-bold py-3 rounded-lg shadow-lg hover:bg-amber-400 transition-colors">Kaydet</button>
-              </div>
+              <button type="submit" className="w-full bg-amber-500 text-slate-900 font-black py-3 rounded-lg text-xs uppercase tracking-widest shadow-lg active:scale-95 transition-all">Kaydet</button>
             </form>
           </div>
         </div>
@@ -431,60 +409,74 @@ const App: React.FC = () => {
   );
 };
 
-const InputGroup = ({ label, value, onChange }: { label: string, value: string, onChange: (v: string) => void }) => (
-  <div>
-    <label className="block text-sm font-semibold text-slate-400 mb-1">{label}</label>
-    <input type="number" step="0.1" value={value} onChange={(e) => onChange(e.target.value)} className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 outline-none" placeholder="0.0" />
-  </div>
-);
-
-const StatCard = ({ icon, label, value, color, onClick, active }: any) => {
-  const activeStyles = {
-    blue: 'border-blue-500 bg-blue-500/20 text-blue-400',
-    amber: 'border-amber-500 bg-amber-500/20 text-amber-400',
-    purple: 'border-purple-500 bg-purple-500/20 text-purple-400',
-    rose: 'border-rose-500 bg-rose-500/20 text-rose-400'
+const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) => {
+  const colors: any = {
+    blue: active ? 'bg-blue-500 text-white' : 'border-blue-500/20 text-blue-400',
+    amber: active ? 'bg-amber-500 text-slate-900' : 'border-amber-500/20 text-amber-400',
+    purple: active ? 'bg-purple-500 text-white' : 'border-purple-500/20 text-purple-400',
+    rose: active ? 'bg-rose-500 text-white' : 'border-rose-500/20 text-rose-400'
   };
-  const baseStyles = 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700';
-
   return (
-    <button onClick={onClick} className={`p-5 rounded-2xl border flex items-center gap-4 transition-all w-full text-left active:scale-95 ${active ? (activeStyles as any)[color] : baseStyles}`}>
-      <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">{icon}</div>
-      <div><p className="text-[10px] font-bold uppercase tracking-wider">{label}</p><p className="text-2xl font-black">{value}</p></div>
+    <button onClick={onClick} className={`flex items-center gap-3 p-3 rounded-xl border transition-all ${active ? colors[color] : (theme === 'dark' ? 'bg-slate-900/40 border-slate-800 hover:border-slate-700' : 'bg-white border-slate-200 hover:border-slate-300 shadow-sm')}`}>
+      <div className={`p-1.5 rounded-lg ${theme === 'dark' ? 'bg-slate-950/50' : 'bg-slate-100'} ${active ? 'text-inherit' : colors[color]}`}>{icon}</div>
+      <div className="text-left"><p className="text-[9px] font-black uppercase opacity-60 leading-none mb-1">{label}</p><p className="text-lg font-black leading-none">{value}</p></div>
     </button>
   );
 };
 
-const MemberCard = ({ member, onEdit, onDelete, highlight }: any) => {
-  const isLowPower = member.power < 10;
-  const isLowLevel = member.level < 20;
-  const isLowTeam1 = member.team1Power < 3;
-
+const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete }: any) => {
+  const isAtRisk = member.power < 10 || member.level < 20 || member.team1Power < 3;
   return (
-    <div className={`flex flex-col border rounded-xl overflow-hidden transition-all duration-300 ${highlight ? 'bg-slate-900 border-rose-500/50 shadow-lg shadow-rose-500/10' : 'bg-slate-900 border-slate-800 hover:border-slate-700'}`}>
-      <div className="p-5 flex-1">
-        <div className="flex justify-between items-start mb-4">
-          <div className="flex items-center gap-3">
-            {member.nameImage ? <img src={member.nameImage} className="h-10 w-24 object-contain rounded border border-slate-700 bg-slate-950" /> : <h4 className="text-lg font-bold text-white max-w-[150px] truncate">{member.name || 'İsimsiz'}</h4>}
-            <span className={`text-[10px] px-1.5 py-0.5 rounded font-black border ${member.level < 20 ? 'text-rose-500 border-rose-500/30' : 'text-green-500 border-green-500/30'}`}>Sv.{member.level}</span>
+    <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'} ${isAtRisk ? (theme === 'dark' ? 'bg-rose-500/[0.02]' : 'bg-rose-500/[0.05]') : ''}`}>
+      <td className="px-4 py-2 text-xs font-black font-mono">
+        {rankIdx ? (
+          <div className="flex items-center gap-1">
+            <span className={`inline-flex items-center justify-center w-7 h-7 rounded-md text-[11px] font-black shadow-sm ${rankIdx === 1 ? 'bg-amber-500 text-slate-900 shadow-amber-500/30' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800/80 text-white' : (theme === 'dark' ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600')}`}>
+              {rankIdx}
+            </span>
           </div>
+        ) : <ChevronRight className="w-3 h-3 opacity-20" />}
+      </td>
+      <td className="px-4 py-2">
+        <div className="flex items-center gap-2">
+          {member.nameImage ? <img src={member.nameImage} className="h-6 w-16 object-contain rounded bg-slate-950 p-0.5" /> : <span className={`text-xs font-bold transition-colors ${theme === 'dark' ? 'text-white group-hover:text-amber-400' : 'text-slate-900 group-hover:text-amber-600'}`}>{member.name}</span>}
+          {isAtRisk && <AlertTriangle className="w-3 h-3 text-rose-500" />}
         </div>
-        <div className="grid grid-cols-2 gap-4">
-          <div><p className="text-[10px] font-bold text-slate-500 uppercase">Toplam Güç</p><p className={`text-xl font-black ${isLowPower ? 'text-rose-500' : 'text-amber-400'}`}>{member.power.toFixed(1)}M</p></div>
-          <div><p className="text-[10px] font-bold text-slate-500 uppercase">Takım 1</p><p className={`text-xl font-black ${isLowTeam1 ? 'text-rose-500' : 'text-blue-400'}`}>{member.team1Power.toFixed(1)}M</p></div>
+      </td>
+      <td className="px-4 py-2">
+        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded border ${member.level < 20 ? 'text-rose-500 border-rose-500/20' : 'text-green-500 border-green-500/20'}`}>Sv.{member.level}</span>
+      </td>
+      <td className="px-4 py-2">
+        <div className="flex items-center gap-1.5">
+          <span className={`text-xs font-black ${member.power < 10 ? 'text-rose-400' : 'text-amber-400'}`}>{member.power.toFixed(1)}M</span>
+          {member.power >= 20 && <TrendingUp className="w-3 h-3 text-emerald-500" />}
         </div>
-      </div>
-      
-      <div className="flex border-t border-slate-800 bg-slate-900/50">
-        <button onClick={onEdit} className="flex-1 flex items-center justify-center gap-2 py-3 text-sm font-bold text-slate-400 hover:text-amber-500 hover:bg-amber-500/5 transition-all border-r border-slate-800">
-          <Edit2 className="w-4 h-4" /> Düzenle
-        </button>
-        <button onClick={onDelete} className="flex-1 flex items-center justify-center gap-2 py-3 text-sm font-bold text-slate-400 hover:text-rose-500 hover:bg-rose-500/5 transition-all">
-          <Trash2 className="w-4 h-4" /> Sil
-        </button>
-      </div>
-    </div>
+      </td>
+      <td className="px-4 py-2">
+        <span className={`text-xs font-black ${member.team1Power < 3 ? 'text-rose-400' : 'text-blue-400'}`}>{member.team1Power.toFixed(1)}M</span>
+      </td>
+      <td className="px-4 py-2">
+        <span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${member.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : member.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{member.rank}</span>
+      </td>
+      <td className="px-4 py-2 text-right">
+        <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button onClick={onEdit} className="p-1.5 hover:bg-amber-500/10 rounded text-slate-400 hover:text-amber-500 transition-colors"><Edit2 className="w-3.5 h-3.5" /></button>
+          <button onClick={onDelete} className="p-1.5 hover:bg-rose-500/10 rounded text-slate-400 hover:text-rose-500 transition-colors"><Trash2 className="w-3.5 h-3.5" /></button>
+        </div>
+      </td>
+    </tr>
   );
 };
+
+const MiniInput = ({ label, value, onChange, theme }: any) => (
+  <div>
+    <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">{label}</label>
+    <input 
+      type="number" step="0.1" value={value} onChange={(e) => onChange(e.target.value)} 
+      className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded p-2 text-xs outline-none focus:border-amber-500 transition-all`} 
+      placeholder="0.0" 
+    />
+  </div>
+);
 
 export default App;
