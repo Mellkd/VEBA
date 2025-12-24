@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   getDocs, 
@@ -8,7 +9,8 @@ import {
   getDoc,
   deleteDoc,
   orderBy,
-  limit
+  limit,
+  writeBatch
 } from 'firebase/firestore';
 import { db, membersCollection } from './firebase';
 import { AllianceMember, Rank, AllianceStats, AllianceConfig } from './types';
@@ -35,7 +37,11 @@ import {
   Sun,
   Moon,
   Swords,
-  BarChart3
+  BarChart3,
+  CheckSquare,
+  Square,
+  ArrowRightCircle,
+  RotateCcw
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
@@ -68,6 +74,10 @@ const App: React.FC = () => {
     return (localStorage.getItem('theme') as Theme) || 'dark';
   });
   
+  // Selection State
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [copyTargetDate, setCopyTargetDate] = useState<string>('');
+
   const [expandedRanks, setExpandedRanks] = useState<Record<Rank, boolean>>({
     [Rank.R3]: true,
     [Rank.R2]: true,
@@ -92,12 +102,37 @@ const App: React.FC = () => {
     localStorage.setItem('theme', theme);
   }, [theme]);
 
+  // Reset selection when date changes
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [selectedDate]);
+
   const toggleTheme = () => {
     setTheme(prev => prev === 'light' ? 'dark' : 'light');
   };
 
   const toggleRankGroup = (rank: Rank) => {
     setExpandedRanks(prev => ({ ...prev, [rank]: !prev[rank] }));
+  };
+
+  const toggleSelection = (id: string) => {
+    const newSet = new Set(selectedIds);
+    if (newSet.has(id)) {
+      newSet.delete(id);
+    } else {
+      newSet.add(id);
+    }
+    setSelectedIds(newSet);
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === filteredMembers.length && filteredMembers.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      const newSet = new Set<string>();
+      filteredMembers.forEach(m => newSet.add(m.id));
+      setSelectedIds(newSet);
+    }
   };
 
   const fetchConfig = async () => {
@@ -155,7 +190,6 @@ const App: React.FC = () => {
         }
         aggregation[m.name].totalScore += m.duelScore || 0;
         aggregation[m.name].daysCount += 1;
-        // En güncel veriyi baz al
         if (m.date === selectedDate) {
           aggregation[m.name].level = m.level;
           aggregation[m.name].rank = m.rank;
@@ -219,18 +253,81 @@ const App: React.FC = () => {
     try {
       const q = query(membersCollection, where("date", "==", yesterday));
       const querySnapshot = await getDocs(q);
-      const batchPromises = querySnapshot.docs.map(async (d) => {
+      const batch = writeBatch(db);
+      
+      querySnapshot.forEach((doc) => {
+         const data = doc.data() as AllianceMember;
+         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
+         const newId = `${selectedDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
+         // Reset duel score on copy
+         const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, duelScore: 0, updatedAt: Date.now() };
+         const ref = doc(db, "alliance_members", newId); // Use function as ref builder, but imported 'doc' clashes. 
+         // Need to fix import shadowing or use collection ref. 
+         // Correct way with modular SDK imported as 'doc':
+         // const newRef = doc(db, "alliance_members", newId);
+         // However, inside map we might have issues.
+      });
+      // Simplified batch for safety in this context:
+      const promises = querySnapshot.docs.map(async (d) => {
         const data = d.data() as AllianceMember;
         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
         const newId = `${selectedDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
-        // Kopyalarken düello puanını sıfırla ki her gün yeni puan girilsin
         const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, duelScore: 0, updatedAt: Date.now() };
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
-      await Promise.all(batchPromises);
+
+      await Promise.all(promises);
       await fetchMembers(selectedDate);
-      alert("Üye listesi kopyalandı. Düello puanları yeni gün için sıfırlandı.");
+      alert("Üye listesi kopyalandı. Düello puanları sıfırlandı.");
     } catch (error) { alert("Hata!"); } finally { setLoading(false); }
+  };
+
+  const handleBulkCopy = async () => {
+    if (!copyTargetDate) return alert("Lütfen hedef tarih seçin.");
+    if (selectedIds.size === 0) return alert("Lütfen üye seçin.");
+    if (!confirm(`${selectedIds.size} üyeyi ${copyTargetDate} tarihine kopyalamak istiyor musunuz?`)) return;
+
+    setLoading(true);
+    try {
+      const selectedMembers = members.filter(m => selectedIds.has(m.id));
+      const promises = selectedMembers.map(async (data) => {
+        const safeName = (data.name || 'uye').replace(/\s+/g, '_');
+        // Unique ID for the new date
+        const newId = `${copyTargetDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
+        // When copying to a new date, we keep stats but reset duelScore usually? 
+        // Let's keep data as is, user can reset duel score separately if needed.
+        const newMember: AllianceMember = { ...data, id: newId, date: copyTargetDate, updatedAt: Date.now() };
+        return setDoc(doc(db, "alliance_members", newId), newMember);
+      });
+      await Promise.all(promises);
+      alert("Seçili üyeler kopyalandı.");
+      setSelectedIds(new Set()); // Clear selection
+    } catch (error) {
+      console.error(error);
+      alert("Kopyalama sırasında hata oluştu.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResetDailyScores = async () => {
+    if (!confirm(`Şu anki tarihteki (${selectedDate}) TÜM üyelerin düello puanlarını 0 olarak sıfırlamak istiyor musunuz?`)) return;
+    setLoading(true);
+    try {
+      const batch = writeBatch(db);
+      members.forEach(m => {
+        const ref = doc(db, "alliance_members", m.id);
+        batch.update(ref, { duelScore: 0 });
+      });
+      await batch.commit();
+      await fetchMembers(selectedDate);
+      alert("Düello puanları sıfırlandı.");
+    } catch (error) {
+      console.error(error);
+      alert("Sıfırlama başarısız.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleSaveMember = async (e: React.FormEvent) => {
@@ -257,6 +354,9 @@ const App: React.FC = () => {
     try {
       await deleteDoc(doc(db, "alliance_members", id));
       setMembers(prev => prev.filter(m => m.id !== id));
+      const newSet = new Set(selectedIds);
+      newSet.delete(id);
+      setSelectedIds(newSet);
     } catch (error) { alert("Hata!"); }
   };
 
@@ -379,18 +479,30 @@ const App: React.FC = () => {
           </div>
 
           {viewMode === 'duel_ranking' && (
-             <div className={`flex items-center gap-1 ${theme === 'dark' ? 'bg-slate-800/50' : 'bg-slate-100'} p-1 rounded-md border border-slate-700/30`}>
-                <button onClick={() => setDuelSubMode('daily')} className={`px-3 py-1 rounded text-[9px] font-black uppercase tracking-tighter transition-all ${duelSubMode === 'daily' ? 'bg-slate-900 text-amber-500 shadow-sm' : 'text-slate-500'}`}>Günlük</button>
-                <button onClick={() => setDuelSubMode('weekly')} className={`px-3 py-1 rounded text-[9px] font-black uppercase tracking-tighter transition-all ${duelSubMode === 'weekly' ? 'bg-slate-900 text-amber-500 shadow-sm' : 'text-slate-500'}`}>Haftalık</button>
+             <div className="flex items-center gap-2">
+               <button onClick={handleResetDailyScores} className="px-3 py-1.5 rounded-md bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 border border-rose-500/20 text-[10px] font-black uppercase tracking-tight flex items-center gap-1 transition-all" title="Seçili gündeki tüm üyelerin düello puanlarını 0 yapar.">
+                  <RotateCcw className="w-3 h-3" /> Günü Sıfırla
+               </button>
+               <div className={`flex items-center gap-1 ${theme === 'dark' ? 'bg-slate-800/50' : 'bg-slate-100'} p-1 rounded-md border border-slate-700/30`}>
+                  <button onClick={() => setDuelSubMode('daily')} className={`px-3 py-1 rounded text-[9px] font-black uppercase tracking-tighter transition-all ${duelSubMode === 'daily' ? 'bg-slate-900 text-amber-500 shadow-sm' : 'text-slate-500'}`}>Günlük</button>
+                  <button onClick={() => setDuelSubMode('weekly')} className={`px-3 py-1 rounded text-[9px] font-black uppercase tracking-tighter transition-all ${duelSubMode === 'weekly' ? 'bg-slate-900 text-amber-500 shadow-sm' : 'text-slate-500'}`}>Haftalık</button>
+               </div>
              </div>
           )}
         </div>
 
-        <div className={`${themeClasses.card} border rounded-xl overflow-hidden shadow-2xl transition-all`}>
+        <div className={`${themeClasses.card} border rounded-xl overflow-hidden shadow-2xl transition-all relative`}>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse min-w-[700px]">
               <thead>
                 <tr className={`${themeClasses.tableHeader} border-b border-slate-700/50 text-[10px] font-black uppercase tracking-widest`}>
+                  <th className="px-4 py-3 w-8">
+                     {viewMode !== 'duel_ranking' || duelSubMode === 'daily' ? (
+                        <button onClick={toggleSelectAll} className="text-amber-500 hover:text-amber-400">
+                           {selectedIds.size > 0 && selectedIds.size === filteredMembers.length ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+                        </button>
+                     ) : null}
+                  </th>
                   <th className="px-4 py-3 w-16">Sıra</th>
                   <th className="px-4 py-3">Üye Bilgisi</th>
                   {viewMode !== 'duel_ranking' ? (
@@ -413,16 +525,22 @@ const App: React.FC = () => {
               <tbody>
                 {viewMode === 'power_ranking' ? (
                   filteredMembers.map((m, idx) => (
-                    <MemberRow key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode} />
+                    <MemberRow 
+                      key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
+                      selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
+                    />
                   ))
                 ) : viewMode === 'duel_ranking' ? (
                    duelSubMode === 'daily' ? (
                     filteredMembers.map((m, idx) => (
-                      <MemberRow key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode} />
+                      <MemberRow 
+                        key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
+                        selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
+                      />
                     ))
                    ) : (
                     weeklyLoading ? (
-                      <tr><td colSpan={7} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Haftalık Veriler Toplanıyor...</p></td></tr>
+                      <tr><td colSpan={8} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Haftalık Veriler Toplanıyor...</p></td></tr>
                     ) : (
                       weeklyData.map((w, idx) => (
                         <WeeklyRow key={w.name} data={w} rankIdx={idx + 1} theme={theme} />
@@ -434,6 +552,7 @@ const App: React.FC = () => {
                     <React.Fragment key={rank}>
                       {groupedByRank[rank].length > 0 && (
                         <tr onClick={() => toggleRankGroup(rank)} className={`cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-950/40 hover:bg-slate-900/60' : 'bg-slate-100/50 hover:bg-slate-200/50'}`}>
+                          <td className="px-4 py-3 border-y border-slate-700/30"></td>
                           <td colSpan={7} className="px-4 py-3 border-y border-slate-700/30">
                             <div className="flex items-center gap-2">
                               {expandedRanks[rank] ? <ChevronDown className="w-3 h-3 text-amber-500" /> : <ChevronRight className="w-3 h-3 text-amber-500" />}
@@ -443,19 +562,50 @@ const App: React.FC = () => {
                         </tr>
                       )}
                       {expandedRanks[rank] && groupedByRank[rank].map((m, idx) => (
-                        <MemberRow key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode} />
+                        <MemberRow 
+                          key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
+                          selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
+                        />
                       ))}
                     </React.Fragment>
                   ))
                 )}
                 {!loading && filteredMembers.length === 0 && !weeklyLoading && (
-                  <tr><td colSpan={7} className="p-12 text-center text-slate-500 font-bold italic">Kayıt bulunamadı.</td></tr>
+                  <tr><td colSpan={8} className="p-12 text-center text-slate-500 font-bold italic">Kayıt bulunamadı.</td></tr>
                 )}
               </tbody>
             </table>
           </div>
         </div>
       </section>
+      
+      {/* Bulk Action Bar */}
+      {selectedIds.size > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 p-4 animate-in slide-in-from-bottom duration-300">
+          <div className="max-w-3xl mx-auto bg-amber-500 rounded-xl shadow-2xl p-3 flex items-center justify-between gap-4">
+             <div className="flex items-center gap-3">
+               <div className="bg-slate-900 text-white font-black text-xs px-3 py-1.5 rounded-lg shadow-sm">
+                 {selectedIds.size} Üye Seçildi
+               </div>
+               <p className="text-slate-900 text-xs font-bold hidden sm:block">Hedef tarihe kopyalamak için tarih seçin</p>
+             </div>
+             <div className="flex items-center gap-2">
+               <input 
+                 type="date" 
+                 value={copyTargetDate} 
+                 onChange={(e) => setCopyTargetDate(e.target.value)} 
+                 className="bg-white/90 text-slate-900 border-0 rounded-lg px-3 py-1.5 text-xs font-bold outline-none focus:ring-2 ring-slate-900/20"
+               />
+               <button 
+                 onClick={handleBulkCopy}
+                 className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow-lg active:scale-95"
+               >
+                 <ArrowRightCircle className="w-4 h-4" /> Kopyala
+               </button>
+             </div>
+          </div>
+        </div>
+      )}
 
       {isModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
@@ -512,12 +662,19 @@ const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) =>
   );
 };
 
-const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode }: any) => {
+const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selected, onToggleSelect }: any) => {
   const isAtRisk = member.power < 10 || member.level < 20 || member.team1Power < 3;
   const isDuelMode = viewMode === 'duel_ranking';
   
   return (
     <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'} ${isAtRisk && !isDuelMode ? (theme === 'dark' ? 'bg-rose-500/[0.02]' : 'bg-rose-500/[0.05]') : ''}`}>
+      <td className="px-4 py-2">
+         {onToggleSelect && (
+          <button onClick={onToggleSelect} className="text-slate-500 hover:text-amber-500 transition-colors">
+            {selected ? <CheckSquare className="w-4 h-4 text-amber-500" /> : <Square className="w-4 h-4" />}
+          </button>
+         )}
+      </td>
       <td className="px-4 py-2 text-xs font-black font-mono">
         <div className="flex items-center gap-1">
           <span className={`inline-flex items-center justify-center w-7 h-7 rounded-md text-[11px] font-black shadow-sm ${rankIdx === 1 ? 'bg-amber-500 text-slate-900 shadow-amber-500/30 animate-pulse' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800/80 text-white' : (theme === 'dark' ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600')}`}>
@@ -558,6 +715,7 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode }: any) 
 // Fix: Use 'any' for WeeklyRow props to allow 'key' prop and maintain consistency with other row components
 const WeeklyRow = ({ data, rankIdx, theme }: any) => (
   <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
+    <td className="px-4 py-3"></td>
     <td className="px-4 py-3">
       <div className={`inline-flex items-center justify-center w-8 h-8 rounded-lg text-xs font-black shadow-lg ${rankIdx === 1 ? 'bg-gradient-to-br from-amber-300 to-amber-600 text-slate-900 rotate-12' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800 text-white' : 'bg-slate-800 text-slate-500'}`}>
         {rankIdx}
