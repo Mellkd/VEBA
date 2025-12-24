@@ -41,11 +41,12 @@ import {
   CheckSquare,
   Square,
   ArrowRightCircle,
-  RotateCcw
+  RotateCcw,
+  Target
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
-type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk';
+type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk' | 'lowDuelScore';
 type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking';
 type DuelSubMode = 'daily' | 'weekly';
 type Theme = 'light' | 'dark';
@@ -226,22 +227,33 @@ const App: React.FC = () => {
     };
   }, [members]);
 
+  const lowDuelCount = useMemo(() => {
+    return members.filter(m => (m.duelScore || 0) < 2000000).length;
+  }, [members]);
+
   const filteredMembers = useMemo(() => {
     let result = [...members];
     if (searchQuery.trim()) {
       const queryStr = searchQuery.toLowerCase();
       result = result.filter(m => m.name.toLowerCase().includes(queryStr));
     }
-    if (viewMode !== 'duel_ranking') {
+    
+    if (activeFilter === 'lowDuelScore') {
+      result = result.filter(m => (m.duelScore || 0) < 2000000);
+    } else {
       switch (activeFilter) {
         case 'lowPower': result = result.filter(m => m.power < 10); break;
         case 'lowLevel': result = result.filter(m => m.level < 20); break;
         case 'atRisk': result = result.filter(m => m.power < 10 || m.level < 20 || m.team1Power < 3); break;
       }
-      result.sort((a, b) => b.power - a.power);
-    } else {
-      result.sort((a, b) => (b.duelScore || 0) - (a.duelScore || 0));
     }
+
+    if (viewMode === 'duel_ranking') {
+      result.sort((a, b) => (b.duelScore || 0) - (a.duelScore || 0));
+    } else {
+      result.sort((a, b) => b.power - a.power);
+    }
+    
     return result;
   }, [members, activeFilter, searchQuery, viewMode]);
 
@@ -253,30 +265,14 @@ const App: React.FC = () => {
     try {
       const q = query(membersCollection, where("date", "==", yesterday));
       const querySnapshot = await getDocs(q);
-      const batch = writeBatch(db);
-      
-      querySnapshot.forEach((doc) => {
-         const data = doc.data() as AllianceMember;
-         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
-         const newId = `${selectedDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
-         // Reset duel score on copy
-         const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, duelScore: 0, updatedAt: Date.now() };
-         const ref = doc(db, "alliance_members", newId); // Use function as ref builder, but imported 'doc' clashes. 
-         // Need to fix import shadowing or use collection ref. 
-         // Correct way with modular SDK imported as 'doc':
-         // const newRef = doc(db, "alliance_members", newId);
-         // However, inside map we might have issues.
-      });
-      // Simplified batch for safety in this context:
-      const promises = querySnapshot.docs.map(async (d) => {
+      const batchPromises = querySnapshot.docs.map(async (d) => {
         const data = d.data() as AllianceMember;
         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
         const newId = `${selectedDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
         const newMember: AllianceMember = { ...data, id: newId, date: selectedDate, duelScore: 0, updatedAt: Date.now() };
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
-
-      await Promise.all(promises);
+      await Promise.all(batchPromises);
       await fetchMembers(selectedDate);
       alert("Üye listesi kopyalandı. Düello puanları sıfırlandı.");
     } catch (error) { alert("Hata!"); } finally { setLoading(false); }
@@ -292,16 +288,13 @@ const App: React.FC = () => {
       const selectedMembers = members.filter(m => selectedIds.has(m.id));
       const promises = selectedMembers.map(async (data) => {
         const safeName = (data.name || 'uye').replace(/\s+/g, '_');
-        // Unique ID for the new date
         const newId = `${copyTargetDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
-        // When copying to a new date, we keep stats but reset duelScore usually? 
-        // Let's keep data as is, user can reset duel score separately if needed.
         const newMember: AllianceMember = { ...data, id: newId, date: copyTargetDate, updatedAt: Date.now() };
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
       await Promise.all(promises);
       alert("Seçili üyeler kopyalandı.");
-      setSelectedIds(new Set()); // Clear selection
+      setSelectedIds(new Set()); 
     } catch (error) {
       console.error(error);
       alert("Kopyalama sırasında hata oluştu.");
@@ -334,7 +327,10 @@ const App: React.FC = () => {
     e.preventDefault();
     const powerVal = parseFloat(formPower);
     const team1PowerVal = parseFloat(formTeam1Power);
-    const duelScoreVal = parseFloat(formDuelScore) || 0;
+    // Parse commas for duel score
+    const cleanDuelScore = formDuelScore.replace(/,/g, '');
+    const duelScoreVal = parseInt(cleanDuelScore) || 0;
+    
     const safeName = (formName || 'uye').replace(/\s+/g, '_');
     const memberId = editingMember ? editingMember.id : `${selectedDate}_${safeName}_${Date.now()}`;
     const newMember: AllianceMember = {
@@ -377,7 +373,9 @@ const App: React.FC = () => {
     if (member) {
       setEditingMember(member); setFormName(member.name); setFormNameImage(member.nameImage ?? null);
       setFormPower(member.power.toString()); setFormLevel(member.level); setFormRank(member.rank);
-      setFormTeam1Power(member.team1Power.toString()); setFormDuelScore((member.duelScore || 0).toString());
+      setFormTeam1Power(member.team1Power.toString()); 
+      // Format with commas when opening
+      setFormDuelScore(member.duelScore ? member.duelScore.toLocaleString() : '');
     } else {
       setEditingMember(null); setFormName(''); setFormNameImage(null);
       setFormPower(''); setFormLevel(20); setFormRank(Rank.R1); setFormTeam1Power(''); setFormDuelScore('');
@@ -464,11 +462,12 @@ const App: React.FC = () => {
       </header>
 
       <section className="max-w-7xl mx-auto px-4 py-6">
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-6">
           <StatMini icon={<Users className="w-4 h-4" />} label="Toplam" value={stats.totalMembers} color="blue" active={activeFilter === 'all'} onClick={() => setActiveFilter('all')} theme={theme} />
+          <StatMini icon={<Target className="w-4 h-4" />} label="Düşük Puan (<2M)" value={lowDuelCount} color="rose" active={activeFilter === 'lowDuelScore'} onClick={() => setActiveFilter('lowDuelScore')} theme={theme} />
           <StatMini icon={<Zap className="w-4 h-4" />} label="Düşük Güç" value={stats.lowPowerCount} color="amber" active={activeFilter === 'lowPower'} onClick={() => setActiveFilter('lowPower')} theme={theme} />
           <StatMini icon={<Trophy className="w-4 h-4" />} label="Düşük Sv." value={stats.lowLevelCount} color="purple" active={activeFilter === 'lowLevel'} onClick={() => setActiveFilter('lowLevel')} theme={theme} />
-          <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Kritik" value={stats.totalAtRisk} color="rose" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
+          <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Kritik" value={stats.totalAtRisk} color="orange" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
         </div>
 
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
@@ -621,7 +620,17 @@ const App: React.FC = () => {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <MiniInput label="Toplam Güç (M)" value={formPower} onChange={setFormPower} theme={theme} />
-                <MiniInput label="Düello Puanı (M)" value={formDuelScore} onChange={setFormDuelScore} theme={theme} />
+                <div>
+                   <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Düello Puanı</label>
+                   <input 
+                     type="text" 
+                     value={formDuelScore} 
+                     onChange={(e) => setFormDuelScore(e.target.value)} 
+                     className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded p-2 text-xs outline-none focus:border-amber-500 transition-all font-mono`}
+                     placeholder="12,155,328"
+                   />
+                   <p className="text-[9px] text-slate-500 mt-1 italic">Virgüllü sayı yapıştırabilirsiniz.</p>
+                </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <MiniInput label="Takım 1 (M)" value={formTeam1Power} onChange={setFormTeam1Power} theme={theme} />
@@ -652,7 +661,8 @@ const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) =>
     blue: active ? 'bg-blue-500 text-white' : 'border-blue-500/20 text-blue-400',
     amber: active ? 'bg-amber-500 text-slate-900' : 'border-amber-500/20 text-amber-400',
     purple: active ? 'bg-purple-500 text-white' : 'border-purple-500/20 text-purple-400',
-    rose: active ? 'bg-rose-500 text-white' : 'border-rose-500/20 text-rose-400'
+    rose: active ? 'bg-rose-500 text-white' : 'border-rose-500/20 text-rose-400',
+    orange: active ? 'bg-orange-500 text-white' : 'border-orange-500/20 text-orange-400'
   };
   return (
     <button onClick={onClick} className={`flex items-center gap-3 p-3 rounded-xl border transition-all ${active ? colors[color] : (theme === 'dark' ? 'bg-slate-900/40 border-slate-800 hover:border-slate-700' : 'bg-white border-slate-200 hover:border-slate-300 shadow-sm')}`}>
@@ -664,6 +674,7 @@ const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) =>
 
 const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selected, onToggleSelect }: any) => {
   const isAtRisk = member.power < 10 || member.level < 20 || member.team1Power < 3;
+  const isLowDuel = (member.duelScore || 0) < 2000000;
   const isDuelMode = viewMode === 'duel_ranking';
   
   return (
@@ -686,6 +697,7 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
         <div className="flex items-center gap-2">
           {member.nameImage ? <img src={member.nameImage} className="h-6 w-16 object-contain rounded bg-slate-950 p-0.5" /> : <span className={`text-xs font-bold transition-colors ${theme === 'dark' ? 'text-white group-hover:text-amber-400' : 'text-slate-900 group-hover:text-amber-600'}`}>{member.name}</span>}
           {isAtRisk && !isDuelMode && <AlertTriangle className="w-3 h-3 text-rose-500" />}
+          {isLowDuel && isDuelMode && <AlertTriangle className="w-3 h-3 text-rose-500" />}
         </div>
       </td>
       {!isDuelMode ? (
@@ -696,9 +708,13 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
         </>
       ) : (
         <>
-          <td className="px-4 py-2"><span className="text-sm font-black text-amber-500">{(member.duelScore || 0).toFixed(1)}M</span></td>
+          <td className="px-4 py-2">
+            <span className={`text-sm font-black font-mono tracking-tight ${isLowDuel ? 'text-rose-500' : 'text-amber-500'}`}>
+              {(member.duelScore || 0).toLocaleString()}
+            </span>
+          </td>
           <td className="px-4 py-2"><span className="text-[10px] font-bold text-slate-500 italic">Puan Girişi Gerekli</span></td>
-          <td className="px-4 py-2"><div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden"><div className="h-full bg-amber-500" style={{width: `${Math.min(100, (member.duelScore / 10) * 100)}%`}}></div></div></td>
+          <td className="px-4 py-2"><div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden"><div className={`h-full ${isLowDuel ? 'bg-rose-500' : 'bg-amber-500'}`} style={{width: `${Math.min(100, ((member.duelScore || 0) / 7200000) * 100)}%`}}></div></div></td>
         </>
       )}
       <td className="px-4 py-2"><span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${member.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : member.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{member.rank}</span></td>
@@ -712,7 +728,6 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
   );
 };
 
-// Fix: Use 'any' for WeeklyRow props to allow 'key' prop and maintain consistency with other row components
 const WeeklyRow = ({ data, rankIdx, theme }: any) => (
   <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
     <td className="px-4 py-3"></td>
@@ -728,7 +743,7 @@ const WeeklyRow = ({ data, rankIdx, theme }: any) => (
       </div>
     </td>
     <td className="px-4 py-3"><span className="text-[10px] font-black text-slate-400">Sv.{data.level}</span></td>
-    <td className="px-4 py-3"><span className="text-sm font-black text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded">{data.totalScore.toFixed(1)}M</span></td>
+    <td className="px-4 py-3"><span className="text-sm font-black text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded font-mono tracking-tight">{data.totalScore.toLocaleString()}</span></td>
     <td className="px-4 py-3">
        <div className="flex items-center gap-1">
           {Array.from({length: 7}).map((_, i) => (
