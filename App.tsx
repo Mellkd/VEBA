@@ -42,11 +42,12 @@ import {
   Square,
   ArrowRightCircle,
   RotateCcw,
-  Target
+  Target,
+  AlertOctagon
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
-type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk' | 'lowDuelScore';
+type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk' | 'lowDuelScore' | 'criticalDuelScore';
 type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking';
 type DuelSubMode = 'daily' | 'weekly';
 type Theme = 'light' | 'dark';
@@ -231,6 +232,10 @@ const App: React.FC = () => {
     return members.filter(m => (m.duelScore || 0) < 2000000).length;
   }, [members]);
 
+  const criticalDuelCount = useMemo(() => {
+    return members.filter(m => (m.duelScore || 0) < 1000000).length;
+  }, [members]);
+
   const filteredMembers = useMemo(() => {
     let result = [...members];
     if (searchQuery.trim()) {
@@ -238,7 +243,9 @@ const App: React.FC = () => {
       result = result.filter(m => m.name.toLowerCase().includes(queryStr));
     }
     
-    if (activeFilter === 'lowDuelScore') {
+    if (activeFilter === 'criticalDuelScore') {
+      result = result.filter(m => (m.duelScore || 0) < 1000000);
+    } else if (activeFilter === 'lowDuelScore') {
       result = result.filter(m => (m.duelScore || 0) < 2000000);
     } else {
       switch (activeFilter) {
@@ -462,12 +469,13 @@ const App: React.FC = () => {
       </header>
 
       <section className="max-w-7xl mx-auto px-4 py-6">
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-6">
+        <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
           <StatMini icon={<Users className="w-4 h-4" />} label="Toplam" value={stats.totalMembers} color="blue" active={activeFilter === 'all'} onClick={() => setActiveFilter('all')} theme={theme} />
-          <StatMini icon={<Target className="w-4 h-4" />} label="Düşük Puan (<2M)" value={lowDuelCount} color="rose" active={activeFilter === 'lowDuelScore'} onClick={() => setActiveFilter('lowDuelScore')} theme={theme} />
+          <StatMini icon={<AlertOctagon className="w-4 h-4" />} label="Kritik (< 1M)" value={criticalDuelCount} color="red" active={activeFilter === 'criticalDuelScore'} onClick={() => setActiveFilter('criticalDuelScore')} theme={theme} />
+          <StatMini icon={<Target className="w-4 h-4" />} label="Düşük (< 2M)" value={lowDuelCount} color="orange" active={activeFilter === 'lowDuelScore'} onClick={() => setActiveFilter('lowDuelScore')} theme={theme} />
           <StatMini icon={<Zap className="w-4 h-4" />} label="Düşük Güç" value={stats.lowPowerCount} color="amber" active={activeFilter === 'lowPower'} onClick={() => setActiveFilter('lowPower')} theme={theme} />
           <StatMini icon={<Trophy className="w-4 h-4" />} label="Düşük Sv." value={stats.lowLevelCount} color="purple" active={activeFilter === 'lowLevel'} onClick={() => setActiveFilter('lowLevel')} theme={theme} />
-          <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Kritik" value={stats.totalAtRisk} color="orange" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
+          <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Riskli" value={stats.totalAtRisk} color="rose" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
         </div>
 
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
@@ -662,7 +670,8 @@ const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) =>
     amber: active ? 'bg-amber-500 text-slate-900' : 'border-amber-500/20 text-amber-400',
     purple: active ? 'bg-purple-500 text-white' : 'border-purple-500/20 text-purple-400',
     rose: active ? 'bg-rose-500 text-white' : 'border-rose-500/20 text-rose-400',
-    orange: active ? 'bg-orange-500 text-white' : 'border-orange-500/20 text-orange-400'
+    orange: active ? 'bg-orange-500 text-white' : 'border-orange-500/20 text-orange-400',
+    red: active ? 'bg-red-600 text-white' : 'border-red-600/20 text-red-500'
   };
   return (
     <button onClick={onClick} className={`flex items-center gap-3 p-3 rounded-xl border transition-all ${active ? colors[color] : (theme === 'dark' ? 'bg-slate-900/40 border-slate-800 hover:border-slate-700' : 'bg-white border-slate-200 hover:border-slate-300 shadow-sm')}`}>
@@ -675,6 +684,7 @@ const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) =>
 const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selected, onToggleSelect }: any) => {
   const isAtRisk = member.power < 10 || member.level < 20 || member.team1Power < 3;
   const isLowDuel = (member.duelScore || 0) < 2000000;
+  const isCriticalDuel = (member.duelScore || 0) < 1000000;
   const isDuelMode = viewMode === 'duel_ranking';
   
   return (
@@ -697,7 +707,8 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
         <div className="flex items-center gap-2">
           {member.nameImage ? <img src={member.nameImage} className="h-6 w-16 object-contain rounded bg-slate-950 p-0.5" /> : <span className={`text-xs font-bold transition-colors ${theme === 'dark' ? 'text-white group-hover:text-amber-400' : 'text-slate-900 group-hover:text-amber-600'}`}>{member.name}</span>}
           {isAtRisk && !isDuelMode && <AlertTriangle className="w-3 h-3 text-rose-500" />}
-          {isLowDuel && isDuelMode && <AlertTriangle className="w-3 h-3 text-rose-500" />}
+          {isCriticalDuel && isDuelMode && <AlertOctagon className="w-3 h-3 text-red-500" />}
+          {isLowDuel && !isCriticalDuel && isDuelMode && <AlertTriangle className="w-3 h-3 text-orange-500" />}
         </div>
       </td>
       {!isDuelMode ? (
@@ -709,12 +720,12 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
       ) : (
         <>
           <td className="px-4 py-2">
-            <span className={`text-sm font-black font-mono tracking-tight ${isLowDuel ? 'text-rose-500' : 'text-amber-500'}`}>
+            <span className={`text-sm font-black font-mono tracking-tight ${isCriticalDuel ? 'text-red-500' : isLowDuel ? 'text-orange-500' : 'text-amber-500'}`}>
               {(member.duelScore || 0).toLocaleString()}
             </span>
           </td>
           <td className="px-4 py-2"><span className="text-[10px] font-bold text-slate-500 italic">Puan Girişi Gerekli</span></td>
-          <td className="px-4 py-2"><div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden"><div className={`h-full ${isLowDuel ? 'bg-rose-500' : 'bg-amber-500'}`} style={{width: `${Math.min(100, ((member.duelScore || 0) / 7200000) * 100)}%`}}></div></div></td>
+          <td className="px-4 py-2"><div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden"><div className={`h-full ${isCriticalDuel ? 'bg-red-500' : isLowDuel ? 'bg-orange-500' : 'bg-amber-500'}`} style={{width: `${Math.min(100, ((member.duelScore || 0) / 7200000) * 100)}%`}}></div></div></td>
         </>
       )}
       <td className="px-4 py-2"><span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${member.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : member.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{member.rank}</span></td>
