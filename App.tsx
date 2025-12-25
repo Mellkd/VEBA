@@ -43,7 +43,9 @@ import {
   ArrowRightCircle,
   RotateCcw,
   Target,
-  AlertOctagon
+  AlertOctagon,
+  History,
+  Info
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
@@ -55,9 +57,11 @@ type Theme = 'light' | 'dark';
 interface WeeklyScore {
   name: string;
   totalScore: number;
+  yesterdayScore: number;
   daysCount: number;
   level: number;
   rank: Rank;
+  lastDate: string;
 }
 
 const App: React.FC = () => {
@@ -72,6 +76,7 @@ const App: React.FC = () => {
   const [duelSubMode, setDuelSubMode] = useState<DuelSubMode>('daily');
   const [weeklyData, setWeeklyData] = useState<WeeklyScore[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [weeklyDateRange, setWeeklyDateRange] = useState<{start: string, end: string} | null>(null);
   const [theme, setTheme] = useState<Theme>(() => {
     return (localStorage.getItem('theme') as Theme) || 'dark';
   });
@@ -167,34 +172,71 @@ const App: React.FC = () => {
   const fetchWeeklyData = async () => {
     setWeeklyLoading(true);
     try {
+      // 1. Safe Date Generation
+      // Use T12:00:00 to avoid timezone rolling to previous day
+      const current = new Date(`${selectedDate}T12:00:00`);
+      
       const dateList: string[] = [];
-      const current = new Date(selectedDate);
-      for (let i = 0; i < 7; i++) {
+      const dayOfWeek = current.getDay(); // 0 (Sun) - 6 (Sat)
+      
+      // Calculate start of week (Monday)
+      // If Sun(0), Monday was 6 days ago.
+      // If Mon(1), Monday was 0 days ago.
+      const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+
+      // Create list of dates from Monday to Current Selected Date
+      let startDateStr = '';
+      for (let i = 0; i <= daysSinceMonday; i++) {
         const d = new Date(current);
         d.setDate(d.getDate() - i);
-        dateList.push(d.toISOString().split('T')[0]);
+        const dateStr = d.toISOString().split('T')[0];
+        dateList.push(dateStr);
+        if (i === daysSinceMonday) startDateStr = dateStr;
       }
 
+      setWeeklyDateRange({ start: startDateStr, end: selectedDate });
+
+      // Calculate Yesterday specifically for the column
+      const yesterday = new Date(current);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = yesterday.toISOString().split('T')[0];
+
+      // 2. Fetch Data
       const q = query(membersCollection, where("date", "in", dateList));
       const querySnapshot = await getDocs(q);
       
       const aggregation: Record<string, WeeklyScore> = {};
+
       querySnapshot.forEach(doc => {
         const m = doc.data() as AllianceMember;
-        if (!aggregation[m.name]) {
-          aggregation[m.name] = { 
-            name: m.name, 
+        const name = m.name;
+        
+        if (!aggregation[name]) {
+          aggregation[name] = { 
+            name: name, 
             totalScore: 0, 
+            yesterdayScore: 0,
             daysCount: 0, 
             level: m.level, 
-            rank: m.rank 
+            rank: m.rank,
+            lastDate: m.date
           };
         }
-        aggregation[m.name].totalScore += m.duelScore || 0;
-        aggregation[m.name].daysCount += 1;
-        if (m.date === selectedDate) {
-          aggregation[m.name].level = m.level;
-          aggregation[m.name].rank = m.rank;
+
+        // Sum safely with explicit number conversion
+        aggregation[name].totalScore += Number(m.duelScore || 0);
+        aggregation[name].daysCount += 1;
+        
+        // Check for yesterday
+        if (m.date === yesterdayStr) {
+          aggregation[name].yesterdayScore = Number(m.duelScore || 0);
+        }
+
+        // Update metadata if this record is more recent or matches selected date
+        if (m.date === selectedDate || m.date > aggregation[name].lastDate) {
+          aggregation[name].level = m.level;
+          aggregation[name].rank = m.rank;
+          aggregation[name].lastDate = m.date;
         }
       });
 
@@ -204,6 +246,13 @@ const App: React.FC = () => {
       console.error("Weekly fetch error:", error);
     } finally {
       setWeeklyLoading(false);
+    }
+  };
+
+  const refreshData = async () => {
+    await fetchMembers(selectedDate);
+    if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
+      await fetchWeeklyData();
     }
   };
 
@@ -280,7 +329,7 @@ const App: React.FC = () => {
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
       await Promise.all(batchPromises);
-      await fetchMembers(selectedDate);
+      await refreshData();
       alert("Üye listesi kopyalandı. Düello puanları sıfırlandı.");
     } catch (error) { alert("Hata!"); } finally { setLoading(false); }
   };
@@ -300,6 +349,7 @@ const App: React.FC = () => {
         return setDoc(doc(db, "alliance_members", newId), newMember);
       });
       await Promise.all(promises);
+      await refreshData();
       alert("Seçili üyeler kopyalandı.");
       setSelectedIds(new Set()); 
     } catch (error) {
@@ -320,11 +370,60 @@ const App: React.FC = () => {
         batch.update(ref, { duelScore: 0 });
       });
       await batch.commit();
-      await fetchMembers(selectedDate);
+      await refreshData();
       alert("Düello puanları sıfırlandı.");
     } catch (error) {
       console.error(error);
       alert("Sıfırlama başarısız.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCleanDuplicates = async () => {
+    if (!confirm(`Seçili tarihteki (${selectedDate}) mükerrer (aynı isimli) kayıtları temizlemek istiyor musunuz?`)) return;
+    
+    setLoading(true);
+    try {
+      // 1. Fetch all members for this specific date
+      const q = query(membersCollection, where("date", "==", selectedDate));
+      const snapshot = await getDocs(q);
+      
+      const seenNames = new Set<string>();
+      const idsToDelete: string[] = [];
+
+      snapshot.forEach((doc) => {
+        const data = doc.data() as AllianceMember;
+        const name = (data.name || "").trim().toLowerCase(); // Normalize Name
+
+        if (seenNames.has(name)) {
+          // If we have seen this name before in this loop, it is a duplicate. Mark for deletion.
+          idsToDelete.push(doc.id);
+        } else {
+          // If this is the first time seeing this name, keep it (add to set).
+          seenNames.add(name);
+        }
+      });
+
+      if (idsToDelete.length === 0) {
+        alert("Mükerrer kayıt bulunamadı.");
+        setLoading(false);
+        return;
+      }
+
+      // 2. Batch Delete
+      const batch = writeBatch(db);
+      idsToDelete.forEach(id => {
+        batch.delete(doc(db, "alliance_members", id));
+      });
+
+      await batch.commit();
+      await refreshData();
+      alert(`${idsToDelete.length} adet mükerrer kayıt silindi.`);
+
+    } catch (error) {
+      console.error(error);
+      alert("Temizleme işlemi sırasında hata oluştu.");
     } finally {
       setLoading(false);
     }
@@ -347,7 +446,7 @@ const App: React.FC = () => {
     };
     try {
       await setDoc(doc(db, "alliance_members", memberId), newMember);
-      await fetchMembers(selectedDate);
+      await refreshData();
       closeModal();
     } catch (error) { alert("Kaydedilemedi."); }
   };
@@ -360,6 +459,9 @@ const App: React.FC = () => {
       const newSet = new Set(selectedIds);
       newSet.delete(id);
       setSelectedIds(newSet);
+      if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
+        await fetchWeeklyData();
+      }
     } catch (error) { alert("Hata!"); }
   };
 
@@ -461,6 +563,7 @@ const App: React.FC = () => {
             </button>
             <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className={`${themeClasses.input} border rounded px-3 py-1.5 text-xs outline-none`} />
             <button onClick={handleCopyYesterday} className={`${themeClasses.input} hover:bg-slate-200 p-2 rounded border text-slate-500`} title="Dünden kopyala"><Copy className="w-3.5 h-3.5" /></button>
+            <button onClick={handleCleanDuplicates} className={`${themeClasses.input} hover:bg-rose-100 hover:text-rose-600 p-2 rounded border text-slate-500 transition-colors`} title="Mükerrer Kayıtları Temizle"><FilterX className="w-3.5 h-3.5" /></button>
             <button onClick={() => openModal()} className="bg-amber-500 hover:bg-amber-400 text-slate-900 px-4 py-2 rounded font-black flex items-center gap-2 shadow-lg text-xs transition-transform active:scale-95">
               <Plus className="w-4 h-4" /><span>Üye Ekle</span>
             </button>
@@ -498,6 +601,13 @@ const App: React.FC = () => {
           )}
         </div>
 
+        {viewMode === 'duel_ranking' && duelSubMode === 'weekly' && weeklyDateRange && (
+          <div className="mb-4 flex items-center gap-2 text-xs font-bold text-slate-500 bg-slate-500/10 px-3 py-2 rounded-lg border border-slate-500/20">
+             <Info className="w-4 h-4" />
+             <span>Hesaplanan Aralık: <span className="text-amber-500">{weeklyDateRange.start} (Pazartesi)</span> - <span className="text-amber-500">{weeklyDateRange.end} (Seçili Gün)</span></span>
+          </div>
+        )}
+
         <div className={`${themeClasses.card} border rounded-xl overflow-hidden shadow-2xl transition-all relative`}>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse min-w-[700px]">
@@ -520,8 +630,17 @@ const App: React.FC = () => {
                     </>
                   ) : (
                     <>
-                      <th className="px-4 py-3">Günlük Puan</th>
-                      <th className="px-4 py-3">Haftalık Toplam</th>
+                      {duelSubMode === 'daily' ? (
+                        <th className="px-4 py-3">Günlük Puan</th>
+                      ) : (
+                        <>
+                          <th className="px-4 py-3">Dün</th>
+                          <th className="px-4 py-3">Haftalık Toplam</th>
+                        </>
+                      )}
+                      {duelSubMode === 'daily' ? (
+                        <th className="px-4 py-3">Haftalık Toplam</th>
+                      ) : null}
                       <th className="px-4 py-3">İstikrar</th>
                     </>
                   )}
@@ -724,6 +843,7 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
               {(member.duelScore || 0).toLocaleString()}
             </span>
           </td>
+          {/* Daily mode column is empty here as we moved 'Weekly Total' to weekly submode, or we can leave it empty */}
           <td className="px-4 py-2"><span className="text-[10px] font-bold text-slate-500 italic">Puan Girişi Gerekli</span></td>
           <td className="px-4 py-2"><div className="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden"><div className={`h-full ${isCriticalDuel ? 'bg-red-500' : isLowDuel ? 'bg-orange-500' : 'bg-amber-500'}`} style={{width: `${Math.min(100, ((member.duelScore || 0) / 7200000) * 100)}%`}}></div></div></td>
         </>
@@ -739,35 +859,50 @@ const MemberRow = ({ member, rankIdx, theme, onEdit, onDelete, viewMode, selecte
   );
 };
 
-const WeeklyRow = ({ data, rankIdx, theme }: any) => (
-  <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
-    <td className="px-4 py-3"></td>
-    <td className="px-4 py-3">
-      <div className={`inline-flex items-center justify-center w-8 h-8 rounded-lg text-xs font-black shadow-lg ${rankIdx === 1 ? 'bg-gradient-to-br from-amber-300 to-amber-600 text-slate-900 rotate-12' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800 text-white' : 'bg-slate-800 text-slate-500'}`}>
-        {rankIdx}
-      </div>
-    </td>
-    <td className="px-4 py-3">
-      <div className="flex flex-col">
-        <span className={`text-xs font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{data.name}</span>
-        <span className="text-[9px] text-slate-500 font-bold uppercase tracking-widest">{data.daysCount} Günlük Veri</span>
-      </div>
-    </td>
-    <td className="px-4 py-3"><span className="text-[10px] font-black text-slate-400">Sv.{data.level}</span></td>
-    <td className="px-4 py-3"><span className="text-sm font-black text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded font-mono tracking-tight">{data.totalScore.toLocaleString()}</span></td>
-    <td className="px-4 py-3">
-       <div className="flex items-center gap-1">
-          {Array.from({length: 7}).map((_, i) => (
-            <div key={i} className={`w-2 h-2 rounded-full ${i < data.daysCount ? 'bg-emerald-500' : 'bg-slate-700'}`}></div>
-          ))}
-       </div>
-    </td>
-    <td className="px-4 py-3"><span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${data.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : data.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{data.rank}</span></td>
-    <td className="px-4 py-3 text-right">
-       {rankIdx === 1 && <Trophy className="w-4 h-4 text-amber-500 inline" />}
-    </td>
-  </tr>
-);
+const WeeklyRow = ({ data, rankIdx, theme }: any) => {
+  const isLowYesterday = data.yesterdayScore < 2000000;
+  const isCriticalYesterday = data.yesterdayScore < 1000000;
+
+  return (
+    <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
+      <td className="px-4 py-3"></td>
+      <td className="px-4 py-3">
+        <div className={`inline-flex items-center justify-center w-8 h-8 rounded-lg text-xs font-black shadow-lg ${rankIdx === 1 ? 'bg-gradient-to-br from-amber-300 to-amber-600 text-slate-900 rotate-12' : rankIdx === 2 ? 'bg-slate-300 text-slate-900' : rankIdx === 3 ? 'bg-amber-800 text-white' : 'bg-slate-800 text-slate-500'}`}>
+          {rankIdx}
+        </div>
+      </td>
+      <td className="px-4 py-3">
+        <div className="flex flex-col">
+          <span className={`text-xs font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{data.name}</span>
+          <span className="text-[9px] text-slate-500 font-bold uppercase tracking-widest">{data.daysCount} Günlük Veri</span>
+        </div>
+      </td>
+      <td className="px-4 py-3"><span className="text-[10px] font-black text-slate-400">Sv.{data.level}</span></td>
+      <td className="px-4 py-3">
+        <div className="flex items-center gap-1.5">
+           <span className={`text-xs font-black font-mono ${isCriticalYesterday ? 'text-red-500' : isLowYesterday ? 'text-orange-500' : 'text-slate-300'}`}>
+             {data.yesterdayScore > 0 ? data.yesterdayScore.toLocaleString() : '-'}
+           </span>
+           {isCriticalYesterday && data.yesterdayScore > 0 && <AlertOctagon className="w-3 h-3 text-red-500" />}
+           {isLowYesterday && !isCriticalYesterday && data.yesterdayScore > 0 && <AlertTriangle className="w-3 h-3 text-orange-500" />}
+           {data.yesterdayScore === 0 && <History className="w-3 h-3 text-slate-600" />}
+        </div>
+      </td>
+      <td className="px-4 py-3"><span className="text-sm font-black text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded font-mono tracking-tight">{data.totalScore.toLocaleString()}</span></td>
+      <td className="px-4 py-3">
+        <div className="flex items-center gap-1">
+            {Array.from({length: 7}).map((_, i) => (
+              <div key={i} className={`w-2 h-2 rounded-full ${i < data.daysCount ? 'bg-emerald-500' : 'bg-slate-700'}`}></div>
+            ))}
+        </div>
+      </td>
+      <td className="px-4 py-3"><span className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter ${data.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : data.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{data.rank}</span></td>
+      <td className="px-4 py-3 text-right">
+        {rankIdx === 1 && <Trophy className="w-4 h-4 text-amber-500 inline" />}
+      </td>
+    </tr>
+  );
+};
 
 const MiniInput = ({ label, value, onChange, theme }: any) => (
   <div className="flex-1">
