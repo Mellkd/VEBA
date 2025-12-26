@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   getDocs, 
@@ -6,10 +5,8 @@ import {
   where, 
   setDoc, 
   doc, 
-  getDoc,
-  deleteDoc,
-  orderBy,
-  limit,
+  getDoc, 
+  deleteDoc, 
   writeBatch
 } from 'firebase/firestore';
 import { db, membersCollection } from './firebase';
@@ -17,7 +14,6 @@ import { AllianceMember, Rank, AllianceStats, AllianceConfig } from './types';
 import { 
   Users, 
   Plus, 
-  Calendar, 
   Copy, 
   Trash2, 
   AlertTriangle, 
@@ -27,17 +23,13 @@ import {
   Search,
   FilterX,
   Edit2,
-  Settings,
-  Image as ImageIcon,
   LayoutGrid,
   ListOrdered,
   ChevronRight,
   ChevronDown,
-  TrendingUp,
   Sun,
   Moon,
   Swords,
-  BarChart3,
   CheckSquare,
   Square,
   ArrowRightCircle,
@@ -45,12 +37,16 @@ import {
   Target,
   AlertOctagon,
   History,
-  Info
+  Info,
+  LineChart,
+  ArrowUpRight,
+  ArrowDownRight,
+  Minus
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
 type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk' | 'lowDuelScore' | 'criticalDuelScore';
-type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking';
+type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking' | 'progress';
 type DuelSubMode = 'daily' | 'weekly';
 type Theme = 'light' | 'dark';
 
@@ -64,23 +60,43 @@ interface WeeklyScore {
   lastDate: string;
 }
 
+interface ProgressData {
+  name: string;
+  rank: Rank; // Current rank
+  dataPoints: Record<string, { power: number; level: number }>; // date -> data
+  totalGrowth: number;
+  startPower: number;
+  endPower: number;
+}
+
 const App: React.FC = () => {
   const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [members, setMembers] = useState<AllianceMember[]>([]);
   const [loading, setLoading] = useState(true);
   const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [progressLoading, setProgressLoading] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingMember, setEditingMember] = useState<AllianceMember | null>(null);
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
   const [viewMode, setViewMode] = useState<ViewMode>('rank');
   const [duelSubMode, setDuelSubMode] = useState<DuelSubMode>('daily');
   const [weeklyData, setWeeklyData] = useState<WeeklyScore[]>([]);
+  const [progressData, setProgressData] = useState<ProgressData[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [weeklyDateRange, setWeeklyDateRange] = useState<{start: string, end: string} | null>(null);
   const [theme, setTheme] = useState<Theme>(() => {
     return (localStorage.getItem('theme') as Theme) || 'dark';
   });
   
+  // Progress Date Range
+  const [progressStartDate, setProgressStartDate] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 6); // Default 1 week
+    return d.toISOString().split('T')[0];
+  });
+  const [progressEndDate, setProgressEndDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [progressDateList, setProgressDateList] = useState<string[]>([]);
+
   // Selection State
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [copyTargetDate, setCopyTargetDate] = useState<string>('');
@@ -169,22 +185,93 @@ const App: React.FC = () => {
     }
   };
 
+  const fetchProgressData = async () => {
+    setProgressLoading(true);
+    try {
+      // 1. Generate Date List for Column Headers
+      const start = new Date(progressStartDate);
+      const end = new Date(progressEndDate);
+      const dateList: string[] = [];
+      
+      // Safety: Limit to 30 days to prevent browser crash
+      const loopDate = new Date(start);
+      while(loopDate <= end) {
+        dateList.push(loopDate.toISOString().split('T')[0]);
+        loopDate.setDate(loopDate.getDate() + 1);
+        if (dateList.length > 31) break; 
+      }
+      setProgressDateList(dateList);
+
+      // 2. Fetch Data (Range Query)
+      const q = query(
+        membersCollection, 
+        where("date", ">=", progressStartDate), 
+        where("date", "<=", progressEndDate)
+      );
+      
+      const querySnapshot = await getDocs(q);
+      const rawData: AllianceMember[] = [];
+      querySnapshot.forEach(doc => rawData.push(doc.data() as AllianceMember));
+
+      // 3. Aggregate by Name
+      const aggregation: Record<string, ProgressData> = {};
+
+      rawData.forEach(m => {
+        if (!aggregation[m.name]) {
+          aggregation[m.name] = {
+            name: m.name,
+            rank: m.rank,
+            dataPoints: {},
+            totalGrowth: 0,
+            startPower: 0,
+            endPower: 0
+          };
+        }
+        
+        // Update rank to the latest found date's rank
+        if (m.date >= (Object.keys(aggregation[m.name].dataPoints).sort().pop() || '')) {
+             aggregation[m.name].rank = m.rank;
+        }
+
+        aggregation[m.name].dataPoints[m.date] = {
+          power: m.power,
+          level: m.level
+        };
+      });
+
+      // 4. Calculate Growth
+      Object.values(aggregation).forEach(item => {
+        // Find earliest available data point in range
+        const dates = Object.keys(item.dataPoints).sort();
+        if (dates.length > 0) {
+          const firstDate = dates[0];
+          const lastDate = dates[dates.length - 1];
+          item.startPower = item.dataPoints[firstDate].power;
+          item.endPower = item.dataPoints[lastDate].power;
+          // Only calculate growth if we have at least 2 points or the single point is non-zero
+          item.totalGrowth = item.endPower - item.startPower;
+        }
+      });
+
+      // 5. Sort by Growth (Highest first) or End Power
+      const sorted = Object.values(aggregation).sort((a, b) => b.endPower - a.endPower);
+      setProgressData(sorted);
+
+    } catch (error) {
+      console.error("Progress fetch error:", error);
+    } finally {
+      setProgressLoading(false);
+    }
+  };
+
   const fetchWeeklyData = async () => {
     setWeeklyLoading(true);
     try {
-      // 1. Safe Date Generation
-      // Use T12:00:00 to avoid timezone rolling to previous day
       const current = new Date(`${selectedDate}T12:00:00`);
-      
       const dateList: string[] = [];
-      const dayOfWeek = current.getDay(); // 0 (Sun) - 6 (Sat)
-      
-      // Calculate start of week (Monday)
-      // If Sun(0), Monday was 6 days ago.
-      // If Mon(1), Monday was 0 days ago.
+      const dayOfWeek = current.getDay(); 
       const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
 
-      // Create list of dates from Monday to Current Selected Date
       let startDateStr = '';
       for (let i = 0; i <= daysSinceMonday; i++) {
         const d = new Date(current);
@@ -195,13 +282,10 @@ const App: React.FC = () => {
       }
 
       setWeeklyDateRange({ start: startDateStr, end: selectedDate });
-
-      // Calculate Yesterday specifically for the column
       const yesterday = new Date(current);
       yesterday.setDate(yesterday.getDate() - 1);
       const yesterdayStr = yesterday.toISOString().split('T')[0];
 
-      // 2. Fetch Data
       const q = query(membersCollection, where("date", "in", dateList));
       const querySnapshot = await getDocs(q);
       
@@ -222,17 +306,11 @@ const App: React.FC = () => {
             lastDate: m.date
           };
         }
-
-        // Sum safely with explicit number conversion
         aggregation[name].totalScore += Number(m.duelScore || 0);
         aggregation[name].daysCount += 1;
-        
-        // Check for yesterday
         if (m.date === yesterdayStr) {
           aggregation[name].yesterdayScore = Number(m.duelScore || 0);
         }
-
-        // Update metadata if this record is more recent or matches selected date
         if (m.date === selectedDate || m.date > aggregation[name].lastDate) {
           aggregation[name].level = m.level;
           aggregation[name].rank = m.rank;
@@ -250,9 +328,13 @@ const App: React.FC = () => {
   };
 
   const refreshData = async () => {
-    await fetchMembers(selectedDate);
-    if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
-      await fetchWeeklyData();
+    if (viewMode === 'progress') {
+      await fetchProgressData();
+    } else {
+      await fetchMembers(selectedDate);
+      if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
+        await fetchWeeklyData();
+      }
     }
   };
 
@@ -266,7 +348,10 @@ const App: React.FC = () => {
     if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
       fetchWeeklyData();
     }
-  }, [viewMode, duelSubMode, selectedDate]);
+    if (viewMode === 'progress') {
+      fetchProgressData();
+    }
+  }, [viewMode, duelSubMode, selectedDate, progressStartDate, progressEndDate]);
 
   const stats = useMemo<AllianceStats>(() => {
     const lowPower = members.filter(m => m.power < 10).length;
@@ -312,6 +397,15 @@ const App: React.FC = () => {
     
     return result;
   }, [members, activeFilter, searchQuery, viewMode]);
+
+  const filteredProgressData = useMemo(() => {
+    let result = [...progressData];
+    if (searchQuery.trim()) {
+      const queryStr = searchQuery.toLowerCase();
+      result = result.filter(m => m.name.toLowerCase().includes(queryStr));
+    }
+    return result;
+  }, [progressData, searchQuery]);
 
   const handleCopyYesterday = async () => {
     const d = new Date(selectedDate);
@@ -382,45 +476,33 @@ const App: React.FC = () => {
 
   const handleCleanDuplicates = async () => {
     if (!confirm(`Seçili tarihteki (${selectedDate}) mükerrer (aynı isimli) kayıtları temizlemek istiyor musunuz?`)) return;
-    
     setLoading(true);
     try {
-      // 1. Fetch all members for this specific date
       const q = query(membersCollection, where("date", "==", selectedDate));
       const snapshot = await getDocs(q);
-      
       const seenNames = new Set<string>();
       const idsToDelete: string[] = [];
-
       snapshot.forEach((doc) => {
         const data = doc.data() as AllianceMember;
-        const name = (data.name || "").trim().toLowerCase(); // Normalize Name
-
+        const name = (data.name || "").trim().toLowerCase();
         if (seenNames.has(name)) {
-          // If we have seen this name before in this loop, it is a duplicate. Mark for deletion.
           idsToDelete.push(doc.id);
         } else {
-          // If this is the first time seeing this name, keep it (add to set).
           seenNames.add(name);
         }
       });
-
       if (idsToDelete.length === 0) {
         alert("Mükerrer kayıt bulunamadı.");
         setLoading(false);
         return;
       }
-
-      // 2. Batch Delete
       const batch = writeBatch(db);
       idsToDelete.forEach(id => {
         batch.delete(doc(db, "alliance_members", id));
       });
-
       await batch.commit();
       await refreshData();
       alert(`${idsToDelete.length} adet mükerrer kayıt silindi.`);
-
     } catch (error) {
       console.error(error);
       alert("Temizleme işlemi sırasında hata oluştu.");
@@ -433,7 +515,6 @@ const App: React.FC = () => {
     e.preventDefault();
     const powerVal = parseFloat(formPower);
     const team1PowerVal = parseFloat(formTeam1Power);
-    // Parse commas for duel score
     const cleanDuelScore = formDuelScore.replace(/,/g, '');
     const duelScoreVal = parseInt(cleanDuelScore) || 0;
     
@@ -483,7 +564,6 @@ const App: React.FC = () => {
       setEditingMember(member); setFormName(member.name); setFormNameImage(member.nameImage ?? null);
       setFormPower(member.power.toString()); setFormLevel(member.level); setFormRank(member.rank);
       setFormTeam1Power(member.team1Power.toString()); 
-      // Format with commas when opening
       setFormDuelScore(member.duelScore ? member.duelScore.toLocaleString() : '');
     } else {
       setEditingMember(null); setFormName(''); setFormNameImage(null);
@@ -561,31 +641,46 @@ const App: React.FC = () => {
             <button onClick={toggleTheme} className={`p-2 rounded border ${theme === 'dark' ? 'border-slate-700 text-slate-300 hover:bg-slate-800' : 'border-slate-200 text-slate-600 hover:bg-slate-100'} transition-all`}>
               {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
             </button>
-            <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className={`${themeClasses.input} border rounded px-3 py-1.5 text-xs outline-none`} />
-            <button onClick={handleCopyYesterday} className={`${themeClasses.input} hover:bg-slate-200 p-2 rounded border text-slate-500`} title="Dünden kopyala"><Copy className="w-3.5 h-3.5" /></button>
-            <button onClick={handleCleanDuplicates} className={`${themeClasses.input} hover:bg-rose-100 hover:text-rose-600 p-2 rounded border text-slate-500 transition-colors`} title="Mükerrer Kayıtları Temizle"><FilterX className="w-3.5 h-3.5" /></button>
-            <button onClick={() => openModal()} className="bg-amber-500 hover:bg-amber-400 text-slate-900 px-4 py-2 rounded font-black flex items-center gap-2 shadow-lg text-xs transition-transform active:scale-95">
-              <Plus className="w-4 h-4" /><span>Üye Ekle</span>
-            </button>
+            
+            {/* Conditional Date Pickers based on View Mode */}
+            {viewMode === 'progress' ? (
+              <div className="flex items-center gap-1 bg-slate-500/10 p-1 rounded border border-slate-500/20">
+                <input type="date" value={progressStartDate} onChange={(e) => setProgressStartDate(e.target.value)} className={`${themeClasses.input} border rounded px-2 py-1 text-[10px] outline-none w-24`} />
+                <span className="text-slate-500 text-[10px]">-</span>
+                <input type="date" value={progressEndDate} onChange={(e) => setProgressEndDate(e.target.value)} className={`${themeClasses.input} border rounded px-2 py-1 text-[10px] outline-none w-24`} />
+              </div>
+            ) : (
+              <>
+                 <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className={`${themeClasses.input} border rounded px-3 py-1.5 text-xs outline-none`} />
+                 <button onClick={handleCopyYesterday} className={`${themeClasses.input} hover:bg-slate-200 p-2 rounded border text-slate-500`} title="Dünden kopyala"><Copy className="w-3.5 h-3.5" /></button>
+                 <button onClick={handleCleanDuplicates} className={`${themeClasses.input} hover:bg-rose-100 hover:text-rose-600 p-2 rounded border text-slate-500 transition-colors`} title="Mükerrer Kayıtları Temizle"><FilterX className="w-3.5 h-3.5" /></button>
+                 <button onClick={() => openModal()} className="bg-amber-500 hover:bg-amber-400 text-slate-900 px-4 py-2 rounded font-black flex items-center gap-2 shadow-lg text-xs transition-transform active:scale-95">
+                   <Plus className="w-4 h-4" /><span>Üye Ekle</span>
+                 </button>
+              </>
+            )}
           </div>
         </div>
       </header>
 
       <section className="max-w-7xl mx-auto px-4 py-6">
-        <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
-          <StatMini icon={<Users className="w-4 h-4" />} label="Toplam" value={stats.totalMembers} color="blue" active={activeFilter === 'all'} onClick={() => setActiveFilter('all')} theme={theme} />
-          <StatMini icon={<AlertOctagon className="w-4 h-4" />} label="Kritik (< 1M)" value={criticalDuelCount} color="red" active={activeFilter === 'criticalDuelScore'} onClick={() => setActiveFilter('criticalDuelScore')} theme={theme} />
-          <StatMini icon={<Target className="w-4 h-4" />} label="Düşük (< 2M)" value={lowDuelCount} color="orange" active={activeFilter === 'lowDuelScore'} onClick={() => setActiveFilter('lowDuelScore')} theme={theme} />
-          <StatMini icon={<Zap className="w-4 h-4" />} label="Düşük Güç" value={stats.lowPowerCount} color="amber" active={activeFilter === 'lowPower'} onClick={() => setActiveFilter('lowPower')} theme={theme} />
-          <StatMini icon={<Trophy className="w-4 h-4" />} label="Düşük Sv." value={stats.lowLevelCount} color="purple" active={activeFilter === 'lowLevel'} onClick={() => setActiveFilter('lowLevel')} theme={theme} />
-          <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Riskli" value={stats.totalAtRisk} color="rose" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
-        </div>
+        {viewMode !== 'progress' && (
+          <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
+            <StatMini icon={<Users className="w-4 h-4" />} label="Toplam" value={stats.totalMembers} color="blue" active={activeFilter === 'all'} onClick={() => setActiveFilter('all')} theme={theme} />
+            <StatMini icon={<AlertOctagon className="w-4 h-4" />} label="Kritik (< 1M)" value={criticalDuelCount} color="red" active={activeFilter === 'criticalDuelScore'} onClick={() => setActiveFilter('criticalDuelScore')} theme={theme} />
+            <StatMini icon={<Target className="w-4 h-4" />} label="Düşük (< 2M)" value={lowDuelCount} color="orange" active={activeFilter === 'lowDuelScore'} onClick={() => setActiveFilter('lowDuelScore')} theme={theme} />
+            <StatMini icon={<Zap className="w-4 h-4" />} label="Düşük Güç" value={stats.lowPowerCount} color="amber" active={activeFilter === 'lowPower'} onClick={() => setActiveFilter('lowPower')} theme={theme} />
+            <StatMini icon={<Trophy className="w-4 h-4" />} label="Düşük Sv." value={stats.lowLevelCount} color="purple" active={activeFilter === 'lowLevel'} onClick={() => setActiveFilter('lowLevel')} theme={theme} />
+            <StatMini icon={<AlertTriangle className="w-4 h-4" />} label="Riskli" value={stats.totalAtRisk} color="rose" active={activeFilter === 'atRisk'} onClick={() => setActiveFilter('atRisk')} theme={theme} />
+          </div>
+        )}
 
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
           <div className={`flex items-center gap-2 ${theme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-200/50 border-slate-300'} p-1 rounded-lg border w-fit`}>
             <button onClick={() => setViewMode('rank')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'rank' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><LayoutGrid className="w-3 h-3 inline mr-1" /> Rütbe</button>
             <button onClick={() => setViewMode('power_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'power_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><ListOrdered className="w-3 h-3 inline mr-1" /> Güç</button>
             <button onClick={() => setViewMode('duel_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'duel_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><Swords className="w-3 h-3 inline mr-1" /> Düello</button>
+            <button onClick={() => setViewMode('progress')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'progress' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><LineChart className="w-3 h-3 inline mr-1" /> Gelişim</button>
           </div>
 
           {viewMode === 'duel_ranking' && (
@@ -613,90 +708,114 @@ const App: React.FC = () => {
             <table className="w-full text-left border-collapse min-w-[700px]">
               <thead>
                 <tr className={`${themeClasses.tableHeader} border-b border-slate-700/50 text-[10px] font-black uppercase tracking-widest`}>
-                  <th className="px-4 py-3 w-8">
-                     {viewMode !== 'duel_ranking' || duelSubMode === 'daily' ? (
-                        <button onClick={toggleSelectAll} className="text-amber-500 hover:text-amber-400">
-                           {selectedIds.size > 0 && selectedIds.size === filteredMembers.length ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
-                        </button>
-                     ) : null}
-                  </th>
-                  <th className="px-4 py-3 w-16">Sıra</th>
-                  <th className="px-4 py-3">Üye Bilgisi</th>
-                  {viewMode !== 'duel_ranking' ? (
-                    <>
-                      <th className="px-4 py-3">Seviye</th>
-                      <th className="px-4 py-3">Toplam Güç</th>
-                      <th className="px-4 py-3">Takım 1</th>
-                    </>
+                  {viewMode === 'progress' ? (
+                     <>
+                      <th className="px-4 py-3 sticky left-0 z-10 bg-inherit border-r border-slate-700/30 w-48">Üye</th>
+                      {progressDateList.map(date => (
+                        <th key={date} className="px-3 py-3 text-center min-w-[80px]">
+                          {new Date(date).toLocaleDateString('tr-TR', { day: 'numeric', month: 'numeric' })}
+                        </th>
+                      ))}
+                      <th className="px-4 py-3 sticky right-0 z-10 bg-inherit border-l border-slate-700/30 text-center">Değişim</th>
+                     </>
                   ) : (
                     <>
-                      {duelSubMode === 'daily' ? (
-                        <th className="px-4 py-3">Günlük Puan</th>
+                      <th className="px-4 py-3 w-8">
+                        {viewMode !== 'duel_ranking' || duelSubMode === 'daily' ? (
+                            <button onClick={toggleSelectAll} className="text-amber-500 hover:text-amber-400">
+                              {selectedIds.size > 0 && selectedIds.size === filteredMembers.length ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+                            </button>
+                        ) : null}
+                      </th>
+                      <th className="px-4 py-3 w-16">Sıra</th>
+                      <th className="px-4 py-3">Üye Bilgisi</th>
+                      {viewMode !== 'duel_ranking' ? (
+                        <>
+                          <th className="px-4 py-3">Seviye</th>
+                          <th className="px-4 py-3">Toplam Güç</th>
+                          <th className="px-4 py-3">Takım 1</th>
+                        </>
                       ) : (
                         <>
-                          <th className="px-4 py-3">Dün</th>
-                          <th className="px-4 py-3">Haftalık Toplam</th>
+                          {duelSubMode === 'daily' ? (
+                            <th className="px-4 py-3">Günlük Puan</th>
+                          ) : (
+                            <>
+                              <th className="px-4 py-3">Dün</th>
+                              <th className="px-4 py-3">Haftalık Toplam</th>
+                            </>
+                          )}
+                          {duelSubMode === 'daily' ? (
+                            <th className="px-4 py-3">Haftalık Toplam</th>
+                          ) : null}
+                          <th className="px-4 py-3">İstikrar</th>
                         </>
                       )}
-                      {duelSubMode === 'daily' ? (
-                        <th className="px-4 py-3">Haftalık Toplam</th>
-                      ) : null}
-                      <th className="px-4 py-3">İstikrar</th>
+                      <th className="px-4 py-3">Rütbe</th>
+                      <th className="px-4 py-3 text-right">İşlemler</th>
                     </>
                   )}
-                  <th className="px-4 py-3">Rütbe</th>
-                  <th className="px-4 py-3 text-right">İşlemler</th>
                 </tr>
               </thead>
               <tbody>
-                {viewMode === 'power_ranking' ? (
-                  filteredMembers.map((m, idx) => (
-                    <MemberRow 
-                      key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
-                      selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
-                    />
-                  ))
-                ) : viewMode === 'duel_ranking' ? (
-                   duelSubMode === 'daily' ? (
+                {viewMode === 'progress' ? (
+                   progressLoading ? (
+                      <tr><td colSpan={progressDateList.length + 2} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Gelişim Verileri Analiz Ediliyor...</p></td></tr>
+                   ) : (
+                      filteredProgressData.map((item, idx) => (
+                        <ProgressRow key={item.name} item={item} dates={progressDateList} theme={theme} />
+                      ))
+                   )
+                ) : (
+                  viewMode === 'power_ranking' ? (
                     filteredMembers.map((m, idx) => (
                       <MemberRow 
                         key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
                         selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
                       />
                     ))
-                   ) : (
-                    weeklyLoading ? (
-                      <tr><td colSpan={8} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Haftalık Veriler Toplanıyor...</p></td></tr>
-                    ) : (
-                      weeklyData.map((w, idx) => (
-                        <WeeklyRow key={w.name} data={w} rankIdx={idx + 1} theme={theme} />
-                      ))
-                    )
-                   )
-                ) : (
-                  ([Rank.R3, Rank.R2, Rank.R1] as Rank[]).map(rank => (
-                    <React.Fragment key={rank}>
-                      {groupedByRank[rank].length > 0 && (
-                        <tr onClick={() => toggleRankGroup(rank)} className={`cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-950/40 hover:bg-slate-900/60' : 'bg-slate-100/50 hover:bg-slate-200/50'}`}>
-                          <td className="px-4 py-3 border-y border-slate-700/30"></td>
-                          <td colSpan={7} className="px-4 py-3 border-y border-slate-700/30">
-                            <div className="flex items-center gap-2">
-                              {expandedRanks[rank] ? <ChevronDown className="w-3 h-3 text-amber-500" /> : <ChevronRight className="w-3 h-3 text-amber-500" />}
-                              <span className="text-[9px] font-black text-amber-500/80 uppercase tracking-[0.2em]">Rütbe {rank} Grubu ({groupedByRank[rank].length})</span>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                      {expandedRanks[rank] && groupedByRank[rank].map((m, idx) => (
+                  ) : viewMode === 'duel_ranking' ? (
+                    duelSubMode === 'daily' ? (
+                      filteredMembers.map((m, idx) => (
                         <MemberRow 
-                          key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
+                          key={m.id} member={m} rankIdx={idx + 1} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
                           selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
                         />
-                      ))}
-                    </React.Fragment>
-                  ))
+                      ))
+                    ) : (
+                      weeklyLoading ? (
+                        <tr><td colSpan={8} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Haftalık Veriler Toplanıyor...</p></td></tr>
+                      ) : (
+                        weeklyData.map((w, idx) => (
+                          <WeeklyRow key={w.name} data={w} rankIdx={idx + 1} theme={theme} />
+                        ))
+                      )
+                    )
+                  ) : (
+                    ([Rank.R3, Rank.R2, Rank.R1] as Rank[]).map(rank => (
+                      <React.Fragment key={rank}>
+                        {groupedByRank[rank].length > 0 && (
+                          <tr onClick={() => toggleRankGroup(rank)} className={`cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-950/40 hover:bg-slate-900/60' : 'bg-slate-100/50 hover:bg-slate-200/50'}`}>
+                            <td className="px-4 py-3 border-y border-slate-700/30"></td>
+                            <td colSpan={7} className="px-4 py-3 border-y border-slate-700/30">
+                              <div className="flex items-center gap-2">
+                                {expandedRanks[rank] ? <ChevronDown className="w-3 h-3 text-amber-500" /> : <ChevronRight className="w-3 h-3 text-amber-500" />}
+                                <span className="text-[9px] font-black text-amber-500/80 uppercase tracking-[0.2em]">Rütbe {rank} Grubu ({groupedByRank[rank].length})</span>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        {expandedRanks[rank] && groupedByRank[rank].map((m, idx) => (
+                          <MemberRow 
+                            key={m.id} member={m} theme={theme} onEdit={() => openModal(m)} onDelete={() => handleDeleteMember(m.id)} viewMode={viewMode}
+                            selected={selectedIds.has(m.id)} onToggleSelect={() => toggleSelection(m.id)}
+                          />
+                        ))}
+                      </React.Fragment>
+                    ))
+                  )
                 )}
-                {!loading && filteredMembers.length === 0 && !weeklyLoading && (
+                {!loading && filteredMembers.length === 0 && !weeklyLoading && !progressLoading && (
                   <tr><td colSpan={8} className="p-12 text-center text-slate-500 font-bold italic">Kayıt bulunamadı.</td></tr>
                 )}
               </tbody>
@@ -705,8 +824,8 @@ const App: React.FC = () => {
         </div>
       </section>
       
-      {/* Bulk Action Bar */}
-      {selectedIds.size > 0 && (
+      {/* Bulk Action Bar - Only show in non-progress modes */}
+      {selectedIds.size > 0 && viewMode !== 'progress' && (
         <div className="fixed bottom-0 left-0 right-0 z-50 p-4 animate-in slide-in-from-bottom duration-300">
           <div className="max-w-3xl mx-auto bg-amber-500 rounded-xl shadow-2xl p-3 flex items-center justify-between gap-4">
              <div className="flex items-center gap-3">
@@ -743,7 +862,13 @@ const App: React.FC = () => {
             <form onSubmit={handleSaveMember} className="p-5 space-y-4">
               <div>
                 <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">İsim</label>
-                <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none focus:border-amber-500`} />
+                <div className="flex items-center gap-2">
+                  <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} className={`flex-1 ${themeClasses.input} border rounded p-2 text-xs outline-none focus:border-amber-500`} />
+                  <label className="cursor-pointer bg-slate-800 p-2 rounded border border-slate-700 hover:border-amber-500 transition-colors" title="Ekran görüntüsünden isim tara">
+                    <Camera className="w-4 h-4 text-slate-400" />
+                    <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                  </label>
+                </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <MiniInput label="Toplam Güç (M)" value={formPower} onChange={setFormPower} theme={theme} />
@@ -780,6 +905,53 @@ const App: React.FC = () => {
         </div>
       )}
     </div>
+  );
+};
+
+const ProgressRow: React.FC<{ item: ProgressData; dates: string[]; theme: string }> = ({ item, dates, theme }) => {
+  return (
+    <tr className={`border-b transition-colors ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
+       <td className={`px-4 py-3 sticky left-0 z-10 border-r border-slate-700/30 ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+         <div className="flex flex-col">
+           <span className={`text-xs font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{item.name}</span>
+           <span className={`text-[9px] font-black uppercase w-fit px-1 rounded mt-1 ${item.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : item.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{item.rank}</span>
+         </div>
+       </td>
+       {dates.map((date, index) => {
+         const data = item.dataPoints[date];
+         // Find previous data point
+         let prevData = null;
+         if (index > 0) {
+            const prevDate = dates[index - 1];
+            prevData = item.dataPoints[prevDate];
+         }
+
+         let powerClass = 'text-slate-400';
+         if (data && prevData) {
+            if (data.power > prevData.power) powerClass = 'text-emerald-500';
+            else if (data.power < prevData.power) powerClass = 'text-rose-500';
+         }
+
+         return (
+           <td key={date} className="px-3 py-3 text-center border-r border-slate-700/10">
+             {data ? (
+               <div className="flex flex-col items-center">
+                 <span className={`text-xs font-black ${powerClass}`}>{data.power.toFixed(1)}M</span>
+                 <span className="text-[9px] text-slate-500">Sv.{data.level}</span>
+               </div>
+             ) : (
+               <span className="text-slate-700">-</span>
+             )}
+           </td>
+         );
+       })}
+       <td className={`px-4 py-3 sticky right-0 z-10 border-l border-slate-700/30 text-center ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+         <div className={`flex items-center justify-center gap-1 font-black text-xs ${item.totalGrowth > 0 ? 'text-emerald-500' : item.totalGrowth < 0 ? 'text-rose-500' : 'text-slate-500'}`}>
+            {item.totalGrowth > 0 ? <ArrowUpRight className="w-3.5 h-3.5" /> : item.totalGrowth < 0 ? <ArrowDownRight className="w-3.5 h-3.5" /> : <Minus className="w-3 h-3" />}
+            <span>{Math.abs(item.totalGrowth).toFixed(1)}M</span>
+         </div>
+       </td>
+    </tr>
   );
 };
 
