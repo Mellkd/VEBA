@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   getDocs, 
@@ -41,12 +42,14 @@ import {
   LineChart,
   ArrowUpRight,
   ArrowDownRight,
-  Minus
+  Minus,
+  Settings2,
+  BarChart2
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
 type FilterType = 'all' | 'lowPower' | 'lowLevel' | 'atRisk' | 'lowDuelScore' | 'criticalDuelScore';
-type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking' | 'progress';
+type ViewMode = 'rank' | 'power_ranking' | 'duel_ranking' | 'progress' | 'duel_progress';
 type DuelSubMode = 'daily' | 'weekly';
 type Theme = 'light' | 'dark';
 
@@ -61,10 +64,12 @@ interface WeeklyScore {
 }
 
 interface ProgressData {
+  id: string; 
   name: string;
-  rank: Rank; // Current rank
-  dataPoints: Record<string, { power: number; level: number }>; // date -> data
+  rank: Rank; 
+  dataPoints: Record<string, { power: number; level: number; duelScore: number }>; 
   totalGrowth: number;
+  totalDuelScore: number; // Sum of scores in range
   startPower: number;
   endPower: number;
 }
@@ -75,7 +80,11 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [weeklyLoading, setWeeklyLoading] = useState(false);
   const [progressLoading, setProgressLoading] = useState(false);
+  
+  // Modals
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isBulkEditModalOpen, setIsBulkEditModalOpen] = useState(false);
+  
   const [editingMember, setEditingMember] = useState<AllianceMember | null>(null);
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
   const [viewMode, setViewMode] = useState<ViewMode>('rank');
@@ -113,6 +122,7 @@ const App: React.FC = () => {
   });
   const logoInputRef = useRef<HTMLInputElement>(null);
 
+  // Single Member Form
   const [formName, setFormName] = useState('');
   const [formNameImage, setFormNameImage] = useState<string | null>(null);
   const [formPower, setFormPower] = useState('');
@@ -121,6 +131,12 @@ const App: React.FC = () => {
   const [formTeam1Power, setFormTeam1Power] = useState('');
   const [formDuelScore, setFormDuelScore] = useState('');
 
+  // Bulk Edit Form
+  const [bulkFormPower, setBulkFormPower] = useState('');
+  const [bulkFormLevel, setBulkFormLevel] = useState('');
+  const [bulkFormTeam1Power, setBulkFormTeam1Power] = useState('');
+  const [bulkFormDuelScore, setBulkFormDuelScore] = useState('');
+
   useEffect(() => {
     localStorage.setItem('theme', theme);
   }, [theme]);
@@ -128,7 +144,7 @@ const App: React.FC = () => {
   // Reset selection when date changes
   useEffect(() => {
     setSelectedIds(new Set());
-  }, [selectedDate]);
+  }, [selectedDate, viewMode]);
 
   const toggleTheme = () => {
     setTheme(prev => prev === 'light' ? 'dark' : 'light');
@@ -149,11 +165,17 @@ const App: React.FC = () => {
   };
 
   const toggleSelectAll = () => {
-    if (selectedIds.size === filteredMembers.length && filteredMembers.length > 0) {
+    // Determine the current list based on view mode
+    let currentList: {id: string}[] = filteredMembers;
+    if (viewMode === 'progress' || viewMode === 'duel_progress') {
+       currentList = filteredProgressData.map(d => ({id: d.id}));
+    }
+
+    if (selectedIds.size === currentList.length && currentList.length > 0) {
       setSelectedIds(new Set());
     } else {
       const newSet = new Set<string>();
-      filteredMembers.forEach(m => newSet.add(m.id));
+      currentList.forEach(m => newSet.add(m.id));
       setSelectedIds(newSet);
     }
   };
@@ -193,7 +215,6 @@ const App: React.FC = () => {
       const end = new Date(progressEndDate);
       const dateList: string[] = [];
       
-      // Safety: Limit to 30 days to prevent browser crash
       const loopDate = new Date(start);
       while(loopDate <= end) {
         dateList.push(loopDate.toISOString().split('T')[0]);
@@ -210,8 +231,8 @@ const App: React.FC = () => {
       );
       
       const querySnapshot = await getDocs(q);
-      const rawData: AllianceMember[] = [];
-      querySnapshot.forEach(doc => rawData.push(doc.data() as AllianceMember));
+      const rawData: (AllianceMember & {id: string})[] = [];
+      querySnapshot.forEach(doc => rawData.push({ id: doc.id, ...doc.data() } as AllianceMember));
 
       // 3. Aggregate by Name
       const aggregation: Record<string, ProgressData> = {};
@@ -219,42 +240,58 @@ const App: React.FC = () => {
       rawData.forEach(m => {
         if (!aggregation[m.name]) {
           aggregation[m.name] = {
+            id: m.id, 
             name: m.name,
             rank: m.rank,
             dataPoints: {},
             totalGrowth: 0,
+            totalDuelScore: 0,
             startPower: 0,
             endPower: 0
           };
         }
         
-        // Update rank to the latest found date's rank
         if (m.date >= (Object.keys(aggregation[m.name].dataPoints).sort().pop() || '')) {
              aggregation[m.name].rank = m.rank;
+             aggregation[m.name].id = m.id; 
         }
 
         aggregation[m.name].dataPoints[m.date] = {
           power: m.power,
-          level: m.level
+          level: m.level,
+          duelScore: m.duelScore || 0
         };
       });
 
-      // 4. Calculate Growth
+      // 4. Calculate Stats
       Object.values(aggregation).forEach(item => {
-        // Find earliest available data point in range
         const dates = Object.keys(item.dataPoints).sort();
+        let scoreSum = 0;
+        
+        dates.forEach(d => {
+            scoreSum += item.dataPoints[d].duelScore || 0;
+        });
+        
         if (dates.length > 0) {
           const firstDate = dates[0];
           const lastDate = dates[dates.length - 1];
           item.startPower = item.dataPoints[firstDate].power;
           item.endPower = item.dataPoints[lastDate].power;
-          // Only calculate growth if we have at least 2 points or the single point is non-zero
           item.totalGrowth = item.endPower - item.startPower;
         }
+        item.totalDuelScore = scoreSum;
       });
 
-      // 5. Sort by Growth (Highest first) or End Power
-      const sorted = Object.values(aggregation).sort((a, b) => b.endPower - a.endPower);
+      // Sort based on view mode (if duel progress, sort by total score, else by power growth/end power)
+      // For now default sort by end power for general progress, but we can switch dynamically if needed.
+      // Let's sort based on context:
+      const sorted = Object.values(aggregation).sort((a, b) => {
+         if (viewMode === 'duel_progress') {
+             return b.totalDuelScore - a.totalDuelScore;
+         }
+         return b.endPower - a.endPower;
+      });
+      
       setProgressData(sorted);
 
     } catch (error) {
@@ -328,7 +365,7 @@ const App: React.FC = () => {
   };
 
   const refreshData = async () => {
-    if (viewMode === 'progress') {
+    if (viewMode === 'progress' || viewMode === 'duel_progress') {
       await fetchProgressData();
     } else {
       await fetchMembers(selectedDate);
@@ -348,7 +385,7 @@ const App: React.FC = () => {
     if (viewMode === 'duel_ranking' && duelSubMode === 'weekly') {
       fetchWeeklyData();
     }
-    if (viewMode === 'progress') {
+    if (viewMode === 'progress' || viewMode === 'duel_progress') {
       fetchProgressData();
     }
   }, [viewMode, duelSubMode, selectedDate, progressStartDate, progressEndDate]);
@@ -404,8 +441,16 @@ const App: React.FC = () => {
       const queryStr = searchQuery.toLowerCase();
       result = result.filter(m => m.name.toLowerCase().includes(queryStr));
     }
+    
+    // Sort logic adjustment for view modes
+    if (viewMode === 'duel_progress') {
+         result.sort((a, b) => b.totalDuelScore - a.totalDuelScore);
+    } else {
+         result.sort((a, b) => b.endPower - a.endPower);
+    }
+
     return result;
-  }, [progressData, searchQuery]);
+  }, [progressData, searchQuery, viewMode]);
 
   const handleCopyYesterday = async () => {
     const d = new Date(selectedDate);
@@ -435,20 +480,80 @@ const App: React.FC = () => {
 
     setLoading(true);
     try {
-      const selectedMembers = members.filter(m => selectedIds.has(m.id));
-      const promises = selectedMembers.map(async (data) => {
-        const safeName = (data.name || 'uye').replace(/\s+/g, '_');
-        const newId = `${copyTargetDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
-        const newMember: AllianceMember = { ...data, id: newId, date: copyTargetDate, updatedAt: Date.now() };
-        return setDoc(doc(db, "alliance_members", newId), newMember);
+      let idsToCopy = Array.from(selectedIds);
+      const batchBatch = []; 
+      for (const id of idsToCopy) {
+         batchBatch.push(getDoc(doc(db, "alliance_members", id)));
+      }
+      const snapshots = await Promise.all(batchBatch);
+      
+      const setPromises = snapshots.map(async (snap) => {
+         if (snap.exists()) {
+             const data = snap.data() as AllianceMember;
+             const safeName = (data.name || 'uye').replace(/\s+/g, '_');
+             const newId = `${copyTargetDate}_${safeName}_${Math.random().toString(36).substr(2, 5)}`;
+             const newMember: AllianceMember = { ...data, id: newId, date: copyTargetDate, updatedAt: Date.now() };
+             return setDoc(doc(db, "alliance_members", newId), newMember);
+         }
       });
-      await Promise.all(promises);
+      
+      await Promise.all(setPromises);
+
       await refreshData();
       alert("Seçili üyeler kopyalandı.");
       setSelectedIds(new Set()); 
     } catch (error) {
       console.error(error);
       alert("Kopyalama sırasında hata oluştu.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleBulkUpdate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!confirm(`${selectedIds.size} üyenin verilerini güncellemek üzeresiniz. Emin misiniz?`)) return;
+
+    setLoading(true);
+    try {
+      const batch = writeBatch(db);
+      
+      // Create update object with only populated fields
+      const updates: any = { updatedAt: Date.now() };
+      
+      if (bulkFormPower !== '') updates.power = parseFloat(bulkFormPower);
+      if (bulkFormLevel !== '') updates.level = parseInt(bulkFormLevel);
+      if (bulkFormTeam1Power !== '') updates.team1Power = parseFloat(bulkFormTeam1Power);
+      if (bulkFormDuelScore !== '') {
+          const cleanScore = bulkFormDuelScore.replace(/,/g, '');
+          updates.duelScore = parseInt(cleanScore) || 0;
+      }
+
+      // Check if there's anything to update
+      if (Object.keys(updates).length <= 1) { // 1 because updatedAt is always there
+         alert("Güncellenecek veri girmediniz.");
+         setLoading(false);
+         return;
+      }
+
+      selectedIds.forEach(id => {
+        const ref = doc(db, "alliance_members", id);
+        batch.update(ref, updates);
+      });
+
+      await batch.commit();
+      await refreshData();
+      
+      setIsBulkEditModalOpen(false);
+      setBulkFormPower('');
+      setBulkFormLevel('');
+      setBulkFormTeam1Power('');
+      setBulkFormDuelScore('');
+      
+      alert("Toplu güncelleme başarılı.");
+    } catch (error) {
+      console.error(error);
+      alert("Güncelleme hatası.");
     } finally {
       setLoading(false);
     }
@@ -643,7 +748,7 @@ const App: React.FC = () => {
             </button>
             
             {/* Conditional Date Pickers based on View Mode */}
-            {viewMode === 'progress' ? (
+            {viewMode === 'progress' || viewMode === 'duel_progress' ? (
               <div className="flex items-center gap-1 bg-slate-500/10 p-1 rounded border border-slate-500/20">
                 <input type="date" value={progressStartDate} onChange={(e) => setProgressStartDate(e.target.value)} className={`${themeClasses.input} border rounded px-2 py-1 text-[10px] outline-none w-24`} />
                 <span className="text-slate-500 text-[10px]">-</span>
@@ -664,7 +769,7 @@ const App: React.FC = () => {
       </header>
 
       <section className="max-w-7xl mx-auto px-4 py-6">
-        {viewMode !== 'progress' && (
+        {viewMode !== 'progress' && viewMode !== 'duel_progress' && (
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
             <StatMini icon={<Users className="w-4 h-4" />} label="Toplam" value={stats.totalMembers} color="blue" active={activeFilter === 'all'} onClick={() => setActiveFilter('all')} theme={theme} />
             <StatMini icon={<AlertOctagon className="w-4 h-4" />} label="Kritik (< 1M)" value={criticalDuelCount} color="red" active={activeFilter === 'criticalDuelScore'} onClick={() => setActiveFilter('criticalDuelScore')} theme={theme} />
@@ -676,11 +781,12 @@ const App: React.FC = () => {
         )}
 
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
-          <div className={`flex items-center gap-2 ${theme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-200/50 border-slate-300'} p-1 rounded-lg border w-fit`}>
+          <div className={`flex items-center gap-2 ${theme === 'dark' ? 'bg-slate-900/40 border-slate-800' : 'bg-slate-200/50 border-slate-300'} p-1 rounded-lg border w-fit flex-wrap`}>
             <button onClick={() => setViewMode('rank')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'rank' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><LayoutGrid className="w-3 h-3 inline mr-1" /> Rütbe</button>
             <button onClick={() => setViewMode('power_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'power_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><ListOrdered className="w-3 h-3 inline mr-1" /> Güç</button>
             <button onClick={() => setViewMode('duel_ranking')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'duel_ranking' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><Swords className="w-3 h-3 inline mr-1" /> Düello</button>
             <button onClick={() => setViewMode('progress')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'progress' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><LineChart className="w-3 h-3 inline mr-1" /> Gelişim</button>
+            <button onClick={() => setViewMode('duel_progress')} className={`px-4 py-1.5 rounded-md text-[10px] font-black uppercase tracking-wider transition-all ${viewMode === 'duel_progress' ? 'bg-amber-500 text-slate-900 shadow-md' : 'text-slate-500 hover:text-slate-900'}`}><BarChart2 className="w-3 h-3 inline mr-1" /> VS Gelişim</button>
           </div>
 
           {viewMode === 'duel_ranking' && (
@@ -708,15 +814,22 @@ const App: React.FC = () => {
             <table className="w-full text-left border-collapse min-w-[700px]">
               <thead>
                 <tr className={`${themeClasses.tableHeader} border-b border-slate-700/50 text-[10px] font-black uppercase tracking-widest`}>
-                  {viewMode === 'progress' ? (
+                  {viewMode === 'progress' || viewMode === 'duel_progress' ? (
                      <>
-                      <th className="px-4 py-3 sticky left-0 z-10 bg-inherit border-r border-slate-700/30 w-48">Üye</th>
+                      <th className="px-4 py-3 sticky left-0 z-10 bg-inherit border-r border-slate-700/30 w-8">
+                         <button onClick={toggleSelectAll} className="text-amber-500 hover:text-amber-400">
+                           {selectedIds.size > 0 ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+                         </button>
+                      </th>
+                      <th className="px-4 py-3 sticky left-8 z-10 bg-inherit border-r border-slate-700/30 w-48">Üye</th>
                       {progressDateList.map(date => (
                         <th key={date} className="px-3 py-3 text-center min-w-[80px]">
                           {new Date(date).toLocaleDateString('tr-TR', { day: 'numeric', month: 'numeric' })}
                         </th>
                       ))}
-                      <th className="px-4 py-3 sticky right-0 z-10 bg-inherit border-l border-slate-700/30 text-center">Değişim</th>
+                      <th className="px-4 py-3 sticky right-0 z-10 bg-inherit border-l border-slate-700/30 text-center">
+                        {viewMode === 'duel_progress' ? 'Toplam Puan' : 'Değişim'}
+                      </th>
                      </>
                   ) : (
                     <>
@@ -758,12 +871,30 @@ const App: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {viewMode === 'progress' ? (
+                {viewMode === 'progress' || viewMode === 'duel_progress' ? (
                    progressLoading ? (
-                      <tr><td colSpan={progressDateList.length + 2} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Gelişim Verileri Analiz Ediliyor...</p></td></tr>
+                      <tr><td colSpan={progressDateList.length + 3} className="p-20 text-center"><div className="animate-spin h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full mx-auto mb-4"></div><p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Gelişim Verileri Analiz Ediliyor...</p></td></tr>
                    ) : (
                       filteredProgressData.map((item, idx) => (
-                        <ProgressRow key={item.name} item={item} dates={progressDateList} theme={theme} />
+                        viewMode === 'duel_progress' ? (
+                            <DuelProgressRow
+                                key={item.id}
+                                item={item}
+                                dates={progressDateList}
+                                theme={theme}
+                                selected={selectedIds.has(item.id)}
+                                onToggleSelect={() => toggleSelection(item.id)}
+                            />
+                        ) : (
+                            <ProgressRow 
+                                key={item.id} 
+                                item={item} 
+                                dates={progressDateList} 
+                                theme={theme} 
+                                selected={selectedIds.has(item.id)}
+                                onToggleSelect={() => toggleSelection(item.id)}
+                            />
+                        )
                       ))
                    )
                 ) : (
@@ -824,26 +955,33 @@ const App: React.FC = () => {
         </div>
       </section>
       
-      {/* Bulk Action Bar - Only show in non-progress modes */}
-      {selectedIds.size > 0 && viewMode !== 'progress' && (
+      {/* Bulk Action Bar */}
+      {selectedIds.size > 0 && (
         <div className="fixed bottom-0 left-0 right-0 z-50 p-4 animate-in slide-in-from-bottom duration-300">
-          <div className="max-w-3xl mx-auto bg-amber-500 rounded-xl shadow-2xl p-3 flex items-center justify-between gap-4">
-             <div className="flex items-center gap-3">
-               <div className="bg-slate-900 text-white font-black text-xs px-3 py-1.5 rounded-lg shadow-sm">
+          <div className="max-w-4xl mx-auto bg-amber-500 rounded-xl shadow-2xl p-3 flex flex-col sm:flex-row items-center justify-between gap-4">
+             <div className="flex items-center gap-3 w-full sm:w-auto">
+               <div className="bg-slate-900 text-white font-black text-xs px-3 py-1.5 rounded-lg shadow-sm whitespace-nowrap">
                  {selectedIds.size} Üye Seçildi
                </div>
-               <p className="text-slate-900 text-xs font-bold hidden sm:block">Hedef tarihe kopyalamak için tarih seçin</p>
+               <button 
+                  onClick={() => setIsBulkEditModalOpen(true)}
+                  className="bg-white hover:bg-slate-100 text-slate-900 px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow-md active:scale-95"
+               >
+                 <Settings2 className="w-4 h-4" /> Seçilenleri Düzenle
+               </button>
              </div>
-             <div className="flex items-center gap-2">
+
+             <div className="flex items-center gap-2 w-full sm:w-auto border-t sm:border-t-0 border-slate-900/10 pt-2 sm:pt-0">
+               <span className="text-slate-900 text-[10px] font-bold uppercase hidden sm:block">Kopyalama:</span>
                <input 
                  type="date" 
                  value={copyTargetDate} 
                  onChange={(e) => setCopyTargetDate(e.target.value)} 
-                 className="bg-white/90 text-slate-900 border-0 rounded-lg px-3 py-1.5 text-xs font-bold outline-none focus:ring-2 ring-slate-900/20"
+                 className="bg-white/90 text-slate-900 border-0 rounded-lg px-3 py-1.5 text-xs font-bold outline-none focus:ring-2 ring-slate-900/20 flex-1"
                />
                <button 
                  onClick={handleBulkCopy}
-                 className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow-lg active:scale-95"
+                 className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow-lg active:scale-95 whitespace-nowrap"
                >
                  <ArrowRightCircle className="w-4 h-4" /> Kopyala
                </button>
@@ -852,6 +990,7 @@ const App: React.FC = () => {
         </div>
       )}
 
+      {/* Main Edit Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
           <div className={`${themeClasses.modal} border rounded-2xl w-full max-w-sm shadow-2xl animate-in zoom-in duration-200`}>
@@ -904,14 +1043,66 @@ const App: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Bulk Edit Modal */}
+      {isBulkEditModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className={`${themeClasses.modal} border rounded-2xl w-full max-w-sm shadow-2xl animate-in zoom-in duration-200`}>
+             <div className={`p-4 border-b ${theme === 'dark' ? 'border-slate-800' : 'border-slate-200'} flex justify-between items-center bg-amber-500/10`}>
+              <div className="flex items-center gap-2">
+                 <Settings2 className="w-5 h-5 text-amber-500" />
+                 <h3 className={`text-sm font-black uppercase tracking-wider ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Toplu Düzenle ({selectedIds.size})</h3>
+              </div>
+              <button onClick={() => setIsBulkEditModalOpen(false)} className="text-slate-500 hover:text-white">✕</button>
+            </div>
+            <div className="p-4 bg-amber-500/5 text-xs text-slate-500 font-bold border-b border-amber-500/10">
+               ⚠️ Sadece doldurduğunuz alanlar güncellenecektir. Boş bıraktığınız alanlar eski değerinde kalır.
+            </div>
+            <form onSubmit={handleBulkUpdate} className="p-5 space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <MiniInput label="Yeni Güç (M)" value={bulkFormPower} onChange={setBulkFormPower} theme={theme} />
+                <div>
+                  <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Yeni Seviye</label>
+                  <select value={bulkFormLevel} onChange={(e) => setBulkFormLevel(e.target.value)} className={`w-full ${themeClasses.input} border rounded p-2 text-xs outline-none`}>
+                    <option value="">Değiştirme</option>
+                    {Array.from({length: 17}, (_, i) => i + 14).map(l => <option key={l} value={l}>Sv.{l}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <MiniInput label="Takım 1 (M)" value={bulkFormTeam1Power} onChange={setBulkFormTeam1Power} theme={theme} />
+                <div>
+                   <label className="text-[10px] font-black uppercase text-slate-500 block mb-1">Düello Puanı</label>
+                   <input 
+                     type="text" 
+                     value={bulkFormDuelScore} 
+                     onChange={(e) => setBulkFormDuelScore(e.target.value)} 
+                     className={`w-full ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-100 border-slate-200 text-slate-900'} border rounded p-2 text-xs outline-none focus:border-amber-500 transition-all font-mono`}
+                     placeholder="Değiştirme"
+                   />
+                </div>
+              </div>
+              <button type="submit" className="w-full bg-amber-500 text-slate-900 font-black py-3 rounded-lg text-xs uppercase tracking-widest shadow-lg active:scale-95 transition-all">
+                {selectedIds.size} Üyeyi Güncelle
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 };
 
-const ProgressRow: React.FC<{ item: ProgressData; dates: string[]; theme: string }> = ({ item, dates, theme }) => {
+const ProgressRow: React.FC<{ item: ProgressData; dates: string[]; theme: string; selected: boolean; onToggleSelect: () => void }> = ({ item, dates, theme, selected, onToggleSelect }) => {
   return (
-    <tr className={`border-b transition-colors ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
-       <td className={`px-4 py-3 sticky left-0 z-10 border-r border-slate-700/30 ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+    <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
+       <td className={`px-4 py-3 sticky left-0 z-10 border-r border-slate-700/30 w-8 ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+          <button onClick={onToggleSelect} className="text-slate-500 hover:text-amber-500 transition-colors">
+            {selected ? <CheckSquare className="w-4 h-4 text-amber-500" /> : <Square className="w-4 h-4" />}
+          </button>
+       </td>
+       <td className={`px-4 py-3 sticky left-8 z-10 border-r border-slate-700/30 w-48 ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
          <div className="flex flex-col">
            <span className={`text-xs font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{item.name}</span>
            <span className={`text-[9px] font-black uppercase w-fit px-1 rounded mt-1 ${item.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : item.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{item.rank}</span>
@@ -919,25 +1110,32 @@ const ProgressRow: React.FC<{ item: ProgressData; dates: string[]; theme: string
        </td>
        {dates.map((date, index) => {
          const data = item.dataPoints[date];
-         // Find previous data point
          let prevData = null;
          if (index > 0) {
             const prevDate = dates[index - 1];
             prevData = item.dataPoints[prevDate];
          }
 
+         // Determining Power Color
          let powerClass = 'text-slate-400';
-         if (data && prevData) {
-            if (data.power > prevData.power) powerClass = 'text-emerald-500';
-            else if (data.power < prevData.power) powerClass = 'text-rose-500';
+         if (data) {
+             if (data.power < 10) {
+                 powerClass = 'text-rose-600 font-black'; // Critical Power < 10M
+             } else if (prevData) {
+                 if (data.power > prevData.power) powerClass = 'text-emerald-500';
+                 else if (data.power < prevData.power) powerClass = 'text-rose-500';
+             }
          }
+
+         // Determining Level Color
+         const levelClass = (data && data.level < 20) ? 'text-rose-600 font-bold' : 'text-slate-500';
 
          return (
            <td key={date} className="px-3 py-3 text-center border-r border-slate-700/10">
              {data ? (
                <div className="flex flex-col items-center">
                  <span className={`text-xs font-black ${powerClass}`}>{data.power.toFixed(1)}M</span>
-                 <span className="text-[9px] text-slate-500">Sv.{data.level}</span>
+                 <span className={`text-[9px] ${levelClass}`}>Sv.{data.level}</span>
                </div>
              ) : (
                <span className="text-slate-700">-</span>
@@ -953,6 +1151,52 @@ const ProgressRow: React.FC<{ item: ProgressData; dates: string[]; theme: string
        </td>
     </tr>
   );
+};
+
+const DuelProgressRow: React.FC<{ item: ProgressData; dates: string[]; theme: string; selected: boolean; onToggleSelect: () => void }> = ({ item, dates, theme, selected, onToggleSelect }) => {
+    return (
+      <tr className={`border-b transition-colors group ${theme === 'dark' ? 'border-slate-800/50 hover:bg-slate-800/30' : 'border-slate-100 hover:bg-slate-50'}`}>
+         <td className={`px-4 py-3 sticky left-0 z-10 border-r border-slate-700/30 w-8 ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+            <button onClick={onToggleSelect} className="text-slate-500 hover:text-amber-500 transition-colors">
+              {selected ? <CheckSquare className="w-4 h-4 text-amber-500" /> : <Square className="w-4 h-4" />}
+            </button>
+         </td>
+         <td className={`px-4 py-3 sticky left-8 z-10 border-r border-slate-700/30 w-48 ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+           <div className="flex flex-col">
+             <span className={`text-xs font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{item.name}</span>
+             <span className={`text-[9px] font-black uppercase w-fit px-1 rounded mt-1 ${item.rank === Rank.R3 ? 'bg-rose-500/10 text-rose-500' : item.rank === Rank.R2 ? 'bg-amber-500/10 text-amber-500' : 'bg-blue-500/10 text-blue-400'}`}>{item.rank}</span>
+           </div>
+         </td>
+         {dates.map((date) => {
+           const data = item.dataPoints[date];
+           const score = data?.duelScore || 0;
+           
+           let scoreClass = 'text-slate-300';
+           if (score === 0) scoreClass = 'text-slate-600';
+           else if (score < 1000000) scoreClass = 'text-orange-500 font-bold';
+           else if (score > 7200000) scoreClass = 'text-emerald-400 font-black';
+           else scoreClass = 'text-amber-500';
+  
+           return (
+             <td key={date} className="px-3 py-3 text-center border-r border-slate-700/10">
+                <span className={`text-xs font-mono tracking-tight ${scoreClass}`}>
+                    {score > 0 ? (score / 1000000).toFixed(2) + 'M' : '-'}
+                </span>
+             </td>
+           );
+         })}
+         <td className={`px-4 py-3 sticky right-0 z-10 border-l border-slate-700/30 text-center ${theme === 'dark' ? 'bg-[#0b1221]' : 'bg-white'}`}>
+           <div className="flex flex-col items-center justify-center">
+              <span className="text-xs font-black text-amber-500 font-mono">
+                {(item.totalDuelScore / 1000000).toFixed(1)}M
+              </span>
+              <div className="w-12 h-1 bg-slate-800 rounded-full mt-1 overflow-hidden">
+                <div className="h-full bg-amber-500" style={{ width: `${Math.min(100, (item.totalDuelScore / (dates.length * 7200000)) * 100)}%` }}></div>
+              </div>
+           </div>
+         </td>
+      </tr>
+    );
 };
 
 const StatMini = ({ icon, label, value, color, active, onClick, theme }: any) => {
